@@ -37,7 +37,7 @@ RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', 
 RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.', re.IGNORECASE)
 # FIX: Understøt nr. med bogstav-suffiks (nr. 10 a)
 RE_NR           = re.compile(r'^###\s*(\d+(?:\s*[a-zA-Z]+)?)[\)\.]', re.IGNORECASE)
-RE_NOTE_BODY    = re.compile(r'^\s*\(\u200B?(\d+)\u200B?\)\s')   # note‑krop (tolerant for indryk + zero-width spaces)
+RE_NOTE_BODY    = re.compile(r'^\(\u200B?(\d+)\u200B?\)\s')   # note‑krop (med zero-width spaces)
 RE_MD_PREFIX    = re.compile(r'^(#+)\s*')
 
 RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')  # inline notehenvisninger (med zero-width spaces)
@@ -50,21 +50,12 @@ def generate_chunk_uuid() -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """Forbedret token-estimering med ordtælling som fallback for kortordet tekst."""
+    """Simpel token-estimering (ca. 4 karakterer per token for dansk tekst)."""
     if not text:
         return 0
-    
-    # Primær heuristik: 4 karakterer ≈ 1 token for dansk tekst
-    char_based = len(text) // 4
-    
-    # Fallback for meget kortordet tekst: ordtælling * 1.3
-    # (dansk har flere sammensatte ord end engelsk, så lidt højere faktor)
-    word_count = len(text.split())
-    word_based = int(word_count * 1.3)
-    
-    # Brug det højeste estimat for at undgå at undervurdere
-    # Dette er konservativt og sikrer at vi ikke overskrider token-grænser
-    return max(char_based, word_based)
+    # Simpel heuristik: 4 karakterer ≈ 1 token for dansk tekst
+    # Dette kan senere erstattes med en rigtig tokenizer
+    return len(text) // 4
 
 
 def should_split_chunk(text: str, max_tokens: Optional[int]) -> bool:
@@ -565,8 +556,8 @@ def make_chunk_id(paragraf: Optional[str], stk: Optional[str] = None, nr: Option
 # Parsing af dokument → basis‑chunks
 # ------------------------------
 
-def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
-    """Returnér (chunks, note_bodies, note_uuid_map)."""
+def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Returnér (chunks, note_bodies)."""
     # 1) Opsamling af note‑kroppe nederst
     note_bodies: Dict[str, str] = {}
     cur_id: Optional[str] = None
