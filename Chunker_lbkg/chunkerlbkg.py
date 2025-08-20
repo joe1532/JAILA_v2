@@ -312,7 +312,7 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         nonlocal cur_id, cur_buf
         if cur_id is None:
             return
-        note_bodies[cur_id] = '\n'.join(cur_buf).strip()
+        note_bodies[cur_id] = ' '.join(cur_buf).strip()
         cur_id, cur_buf = None, []
 
     for ln in lines:
@@ -331,7 +331,7 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
     ctx = {"section": None, "paragraf": None, "stk": None, "nr": None, "buf": []}
 
     def flush_chunk() -> None:
-        body = '\n'.join(ctx["buf"]).strip()
+        body = ' '.join(ctx["buf"]).strip()
         if not body:
             ctx["buf"] = []
             return
@@ -346,8 +346,8 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             return
         # niveau
         if ctx["paragraf"] and ctx["stk"] is None and ctx["nr"] is None:
-            # tekst under § men før stk/nr → implicit stk.1
-            eff_stk = "1"; level = "stk"
+            eff_stk = "1"
+            level = "stk"
         else:
             eff_stk = ctx["stk"]
             level = "nr" if ctx["nr"] is not None else ("stk" if ctx["stk"] is not None else "paragraf")
@@ -456,16 +456,12 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         note_uuid = generate_chunk_uuid()
         note_uuid_map[nid] = note_uuid
         chunks.append({
-            "uuid": note_uuid,  # FIX: Unikt UUID
+            "uuid": note_uuid,
             "chunk_id": f"note({nid})",
             "level": "note",
             "section_label": None,
             "paragraf": None, "stk": None, "nr": None,
-            "text_with_anchors": ntext,
             "text_plain": ntext,
-            "anchor_positions": [],
-            "note_refs": [],
-            "note_uuids": [],
             "referenced_by": [],  # Vil blive udfyldt senere
         })
 
@@ -502,6 +498,27 @@ def build_cross_references(chunks: List[Dict[str, Any]], note_uuid_map: Dict[str
             if chunk_id.startswith("note(") and chunk_id.endswith(")"):
                 note_id = chunk_id[5:-1]  # Remove "note(" and ")"
                 chunk["referenced_by"] = note_references.get(note_id, [])
+
+
+def apply_note_context(chunks: List[Dict[str, Any]]) -> None:
+    """Apply context from first referencing chunk to note chunks."""
+    # Create UUID lookup for quick access
+    chunk_by_uuid = {chunk["uuid"]: chunk for chunk in chunks}
+    
+    for chunk in chunks:
+        if chunk.get("level") == "note":
+            referenced_by = chunk.get("referenced_by", [])
+            if referenced_by:
+                # Get first referencing chunk
+                first_ref_uuid = referenced_by[0]
+                if first_ref_uuid in chunk_by_uuid:
+                    parent_chunk = chunk_by_uuid[first_ref_uuid]
+                    
+                    # Copy context from parent to note
+                    chunk["section_label"] = parent_chunk.get("section_label")
+                    chunk["paragraf"] = parent_chunk.get("paragraf") 
+                    chunk["stk"] = parent_chunk.get("stk")
+                    chunk["nr"] = parent_chunk.get("nr")
 
 
 def clean_orphaned_note_references(chunks: List[Dict[str, Any]], note_uuid_map: Dict[str, str]) -> None:
@@ -854,6 +871,16 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def clean_note_chunk_fields(chunks: List[Dict[str, Any]]) -> None:
+    """Fjern overflødige felter fra note-chunks for et renere output."""
+    fields_to_remove = ["text_with_anchors", "anchor_positions", "note_refs", "note_uuids"]
+    for chunk in chunks:
+        if chunk.get("level") == "note":
+            for field in fields_to_remove:
+                if field in chunk:
+                    del chunk[field]
+
+
 def write_csv(path: str, rows: List[Dict[str, Any]]):
     # This function is no longer used, but kept for potential future use.
     # To re-enable, add the call back in main() and ensure pandas is handled.
@@ -902,6 +929,9 @@ def main():
     
     # Clean up orphaned note references
     clean_orphaned_note_references(chunks, note_uuid_map)
+
+    # Apply note context
+    apply_note_context(chunks)
     
     # Simple QA check
     print(f"📊 Generated {len(chunks)} chunks with UUID cross-references")
@@ -940,6 +970,9 @@ def main():
             section_parents.append(parent)
 
     chunks.extend(section_parents)
+
+    # Ryd op i note-felter før output
+    clean_note_chunk_fields(chunks)
 
     # Skriv filer
     jsonl_path = f"{out_prefix}_chunks.jsonl"
