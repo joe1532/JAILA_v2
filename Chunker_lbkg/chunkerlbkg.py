@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -28,24 +29,24 @@ except ImportError:
 # ------------------------------
 # Regex‑konfiguration (kan tilpasses)
 # ------------------------------
-RE_SECTION      = re.compile(r'^#\s*(.+)$')
+# FIX: Specifik til juridiske dokumenter - undgår falske "# Indledning" osv.
+RE_SECTION      = re.compile(r'^#\s*(AFSNIT|KAPITEL|DEL|BILAG)\s+(.+)$', re.IGNORECASE)
 # FIX: Understøt § med bogstav og mellemrum (§ 33 A)
 RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', re.IGNORECASE)
 # FIX: Case-insensitive Stk. matching
 RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.', re.IGNORECASE)
 # FIX: Understøt nr. med bogstav-suffiks (nr. 10 a)
 RE_NR           = re.compile(r'^###\s*(\d+(?:\s*[a-zA-Z]+)?)[\)\.]', re.IGNORECASE)
-RE_NOTE_BODY    = re.compile(r'^\((\d+)\)\s')   # note‑krop i nederste noteliste
+RE_NOTE_BODY    = re.compile(r'^\((\d+)\)\s')   # note‑krop i nederste noteliste (kræver kolonne 0)
 RE_MD_PREFIX    = re.compile(r'^(#+)\s*')
-# FIX: Case-insensitive leading markers
-RE_LEADING_MARK = re.compile(r'^(stk\.\s*\d+(?:\s*[a-zA-Z]+)?\.\s*|\d+(?:\s*[a-zA-Z]+)?[\.\)]\s*)', re.IGNORECASE)
+
 RE_INLINE_NOTE  = re.compile(r'\((\d+)\)')       # inline notehenvisninger i tekst
 
 ANCHOR_FMT = "⟦{id}⟧"
 
 def generate_chunk_uuid() -> str:
-    """Generate random UUID for chunks (e.g., 'a7f3-2b9e-8c1d')."""
-    return str(uuid.uuid4())[:13]  # Første 13 karakterer: "a7f3-2b9e-8c1d"
+    """Generate full random UUID for chunks to avoid collisions."""
+    return str(uuid.uuid4())  # Fuld UUID: "123e4567-e89b-12d3-a456-426614174000"
 
 # ------------------------------
 # LLM Integration
@@ -127,10 +128,7 @@ def strip_md(line: str) -> str:
 
 def strip_structural_markers(line: str, line_type: str = "body") -> str:
     """Strip kun strukturmarkeringer fra overskriftslinjer, bevar brødtekst ren."""
-    if line_type == "paragraf":
-        # Fjern: ## § 33 A. → bevar hale
-        return re.sub(r'^##\s*§\s*[0-9]+(?:\s*[A-Za-z]+)?\.\s*', '', line).strip()
-    elif line_type == "stk":
+    if line_type == "stk":
         # Fjern: ### Stk. 2. → bevar resten
         return re.sub(r'^###\s*stk\.\s*[0-9A-Za-z]+\.\s*', '', line, flags=re.IGNORECASE).strip()
     elif line_type == "nr":
@@ -141,9 +139,7 @@ def strip_structural_markers(line: str, line_type: str = "body") -> str:
         return strip_md(line)
 
 
-def strip_leading_markers(text: str) -> str:
-    """Fjern indledende "Stk. X." eller "N.)/N." i starten af linjen."""
-    return RE_LEADING_MARK.sub('', text).strip()
+
 
 
 def first_sentence(text: str, max_words: int = 28, fallback_words: int = 24) -> str:
@@ -171,29 +167,41 @@ def summarize_bullet(text: str, max_words: int = 50) -> str:
     return t or text[:150] + (' …' if len(text) > 150 else '')
 
 
-def summarize_bullet_no_ellipses(text: str) -> str:
-    """Summarize bullet for parent chunks WITHOUT ellipses - keep complete sentences."""
+def summarize_bullet_no_ellipses(text: str, max_words: int = 25) -> str:
+    """Summarize bullet for parent chunks WITHOUT ellipses - keep complete sentences.
+    Enforces word limit for consistency with LLM output (20-25 words)."""
     t = text.strip()
+    
     # Find første komplet sætning
     dot = t.find('.')
     if 0 < dot < len(t)-1:
-        # Tag første sætning hvis den er rimelig lang
         first_sent = t[:dot+1].strip()
-        if len(first_sent.split()) >= 5:  # Mindst 5 ord
+        words = first_sent.split()
+        
+        # Tjek ordgrænse på første sætning
+        if len(words) >= 5 and len(words) <= max_words:
             return first_sent
+        elif len(words) > max_words:
+            # Trim til max_words på ordgrænse
+            return ' '.join(words[:max_words])
     
-    # Hvis ingen god første sætning, tag hele teksten (op til rimelig længde)
-    if len(t) <= 200:
+    # Hvis ingen god første sætning, trim hele teksten til ordgrænse
+    words = t.split()
+    if len(words) <= max_words:
         return t
     
-    # Find sidste komplet sætning inden for 200 karakterer
-    truncated = t[:200]
-    last_dot = truncated.rfind('.')
-    if last_dot > 100:  # Hvis der er et punktum efter 100 karakterer
-        return truncated[:last_dot+1]
+    # Trim til max_words og prøv at ende på punktum hvis muligt
+    trimmed = ' '.join(words[:max_words])
+    if trimmed.endswith('.'):
+        return trimmed
     
-    # Fallback: tag hele teksten uden trunkering
-    return t
+    # Find sidste punktum inden for trimmed tekst
+    last_dot = trimmed.rfind('.')
+    if last_dot > len(trimmed) * 0.7:  # Hvis punktum er mindst 70% inde
+        return trimmed[:last_dot+1]
+    
+    # Fallback: brug trimmed tekst uden punktum
+    return trimmed
 
 
 def intro_no_ellipses(text: str) -> str:
@@ -368,7 +376,8 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         if m_sec and not raw.startswith('##') and not raw.startswith('###'):
             # flush forrige chunk
             flush_chunk()
-            current_section_label = strip_md(raw)
+            section_type, section_title = m_sec.groups()
+            current_section_label = f"{section_type} {section_title}"
             ctx.update({"section": current_section_label, "paragraf": None, "stk": None, "nr": None, "buf": []})
             # selve overskriften som chunk (level=afsnit)
             twa, tp, apos, nids = normalize_anchors(current_section_label)
@@ -531,6 +540,20 @@ def clean_orphaned_note_references(chunks: List[Dict[str, Any]], note_uuid_map: 
             
             # Update text_plain by removing all anchors
             chunk["text_plain"] = re.sub(r'⟦\d+⟧', '', cleaned_text).strip()
+            
+            # FIX: Regenerer anchor_positions fra opdateret text_with_anchors
+            new_anchor_positions = []
+            for match in re.finditer(r'⟦(\d+)⟧', cleaned_text):
+                note_id = match.group(1)
+                if note_id in valid_note_ids:  # Dobbelt-tjek for sikkerhed
+                    pos = match.start()
+                    length = len(match.group(0))
+                    new_anchor_positions.append({
+                        "note_id": note_id,
+                        "pos": pos,
+                        "len": length
+                    })
+            chunk["anchor_positions"] = new_anchor_positions
         
         # Report cleaning if any orphaned refs were found
         if len(original_note_refs) > len(cleaned_note_refs):
@@ -704,7 +727,20 @@ def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
                 stk_children.append(c)
                 stk_seen.add(stk_num)
     
-    stk_children.sort(key=lambda c: int(c.get("stk")) if str(c.get("stk")).isdigit() else 10**9)
+    # FIX: Naturlig sortering som i collect_children - håndterer "1", "1a", "1b", "2", "2a" korrekt
+    def natural_sort_key_for_stk(chunk):
+        stk = chunk.get("stk")
+        stk_num = 999999  # fallback
+        stk_letter = ""
+        if stk is not None:
+            stk_str = str(stk).strip()
+            import re
+            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', stk_str)
+            if match:
+                stk_num = int(match.group(1))
+                stk_letter = match.group(2) or ""
+        return (stk_num, stk_letter)
+    stk_children.sort(key=natural_sort_key_for_stk)
     intro = intro_no_ellipses((paragraf_intro_c or {}).get("text_plain", "").strip()) or f"§ {p} indeholder følgende stykker:"
     bullets = []
     for ch in stk_children:
@@ -770,7 +806,7 @@ def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
     if not bullets:
         return None
 
-    intro = first_sentence(section_label)  # typisk kort titel
+    intro = intro_no_ellipses(section_label)  # FIX: Konsistens - brug hele sætning/label
     text_plain = intro + "\n" + "\n".join(f"• {b}" for b in bullets)
 
     # anchor_map: samle laveste børn
