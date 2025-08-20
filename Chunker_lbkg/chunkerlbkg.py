@@ -29,7 +29,7 @@ except ImportError:
 # ------------------------------
 # Regex‑konfiguration (kan tilpasses)
 # ------------------------------
-# FIX: Specifik til juridiske dokumenter - undgår falske "# Indledning" osv.
+# FIX: Specifik til juridiske dokumenter - undgå falske "# Indledning" osv.
 RE_SECTION      = re.compile(r'^#\s*(AFSNIT|KAPITEL|DEL|BILAG)\s+(.+)$', re.IGNORECASE)
 # FIX: Understøt § med bogstav og mellemrum (§ 33 A)
 RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', re.IGNORECASE)
@@ -37,10 +37,10 @@ RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', 
 RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.', re.IGNORECASE)
 # FIX: Understøt nr. med bogstav-suffiks (nr. 10 a)
 RE_NR           = re.compile(r'^###\s*(\d+(?:\s*[a-zA-Z]+)?)[\)\.]', re.IGNORECASE)
-RE_NOTE_BODY    = re.compile(r'^\((\d+)\)\s')   # note‑krop i nederste noteliste (kræver kolonne 0)
+RE_NOTE_BODY    = re.compile(r'^\(\u200B?(\d+)\u200B?\)\s')   # note‑krop (med zero-width spaces)
 RE_MD_PREFIX    = re.compile(r'^(#+)\s*')
 
-RE_INLINE_NOTE  = re.compile(r'\((\d+)\)')       # inline notehenvisninger i tekst
+RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')  # inline notehenvisninger (med zero-width spaces)
 
 ANCHOR_FMT = "⟦{id}⟧"
 
@@ -855,20 +855,9 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]):
 
 
 def write_csv(path: str, rows: List[Dict[str, Any]]):
-    # forsøg pandas, ellers csv‑modul
-    try:
-        import pandas as pd  # type: ignore
-        df = pd.DataFrame(rows)
-        df.to_csv(path, index=False)
-    except Exception:
-        # JSON‑serialiser ikke‑skalare felter
-        fieldnames = sorted({k for r in rows for k in r.keys()})
-        with open(path, 'w', encoding='utf-8', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                r2 = {k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v) for k, v in r.items()}
-                w.writerow(r2)
+    # This function is no longer used, but kept for potential future use.
+    # To re-enable, add the call back in main() and ensure pandas is handled.
+    pass
 
 
 # ------------------------------
@@ -881,6 +870,7 @@ def main():
     ap.add_argument('--out-prefix', default=None, help='Filprefix for output (uden endelse)')
     ap.add_argument('--use-llm-parents', action='store_true', help='Brug LLM til at generere parent chunk bullets')
     ap.add_argument('--fireworks-api-key', help='Fireworks API key (alternativ til miljøvariabel)')
+    ap.add_argument('--no-csv', action='store_true', help='Undlad at generere en CSV-fil')
     args = ap.parse_args()
 
     in_path = args.input
@@ -953,11 +943,14 @@ def main():
 
     # Skriv filer
     jsonl_path = f"{out_prefix}_chunks.jsonl"
-    csv_path   = f"{out_prefix}_chunks.csv"
     write_jsonl(jsonl_path, chunks)
-    write_csv(csv_path, chunks)
 
-    print(f"Wrote {len(chunks)} chunks → {jsonl_path} / {csv_path}")
+    if not args.no_csv:
+        csv_path = f"{out_prefix}_chunks.csv"
+        # write_csv(csv_path, chunks) # Deaktiveret
+        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} (CSV output er deaktiveret)")
+    else:
+        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path}")
 
 
 if __name__ == '__main__':

@@ -52,8 +52,8 @@ for %%f in ("%INPUT_DIR%\*.md") do (
     REM Definer output-sti
     set "OUTPUT_PREFIX=%OUTPUT_DIR%\!FILENAME!"
 
-    REM Kør Python-scriptet
-    python "%SCRIPT_PATH%" --input "%%f" --out-prefix "!OUTPUT_PREFIX!"
+    REM Kør Python-scriptet med --no-csv flaget
+    python "%SCRIPT_PATH%" --input "%%f" --out-prefix "!OUTPUT_PREFIX!" --no-csv
     
     echo.
 )
