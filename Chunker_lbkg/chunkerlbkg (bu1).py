@@ -250,79 +250,6 @@ def clean_ellipses_from_text(text: str) -> str:
     return cleaned.strip()
 
 
-def tag_domsreferencer(text):
-    """Tilføjer <dom> tags omkring domreferencer i teksten."""
-    # Udvidede mønstre til at fange flere formater
-    patterns = [
-        r'\bSKM\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?\d+)? ?[A-ZÆØÅ]+\b',  # SKM 2023 7 HR, SKM.2023.7.HR, SKM 2003 405 HR
-        r'\bTfS\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?(?:[ \.]?[A-ZÆØÅ]+)?',  # TfS 1998 354 H, TfS.1998.354.H, TfS 1995 137 LSR
-        r'\bU\.? ?(?:\d{4}[\.-])? ?\d+(?:[\.\/]\d+)?(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?',  # U 2004.234, U.2004/234H
-        r'\bLSR\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?(?:[ \.]?[A-ZÆØÅ]+)?',  # LSR 2022 42, LSR.2022.42.SR
-        r'\b(?:Vestre|Østre|Højesterets)\.? ?[Ll]andsrets? ?[Dd]om af \d{1,2}\.? ?[a-zæøå]+ \d{4}\b',  # Vestre Landsrets Dom af 12. juni 2018
-        r'\b(?:Højesterets|HR)\.? ?[Dd]om af \d{1,2}\.? ?[a-zæøå]+ \d{4}\b'  # Højesterets Dom af 4. marts 2022
-    ]
-    combined_pattern = re.compile('|'.join(patterns), re.IGNORECASE)
-
-    def replacer(match):
-        raw = match.group(0)
-        dom_id = re.sub(r'\s+', '', raw).replace("/", ".").replace(" ", "")
-        return f'<dom id="{dom_id}">{raw}</dom>'
-
-    return combined_pattern.sub(replacer, text)
-
-
-def tag_jv_referencer(text):
-    """Tilføjer <jv> tags omkring JV-referencer i teksten."""
-    # Mønstre til at fange JV-referencer baseret på dit eksempel
-    patterns = [
-        # Den juridiske vejledning 2025-1 - A.A Processuelle regler for Skatteforvaltningens opgaver
-        r'\bDen juridiske vejledning \d{4}-\d+ - [A-Z]\.[A-Z](?:\.[A-Z])* [^\n\r]+',
-        
-        # Vejledning om Den juridiske vejledning 2025-1
-        r'\bVejledning om Den juridiske vejledning \d{4}-\d+',
-        
-        # Kortere former som "JV 2025-1 A.A"
-        r'\bJV\.? ?\d{4}-\d+ [A-Z]\.[A-Z](?:\.[A-Z])*(?:\s+[^\n\r,\.;]+)?',
-        
-        # "Den juridiske vejledning" efterfulgt af år og sektion
-        r'\bDen juridiske vejledning,? ?\d{4}-\d+,? ?[A-Z]\.[A-Z](?:\.[A-Z])*(?:\s+[^\n\r,\.;]+)?',
-        
-        # Generisk "JV" reference
-        r'\bJV\.? ?\d{4}-\d+(?:\s+[A-Z]\.[A-Z](?:\.[A-Z])*)?(?:\s+[^\n\r,\.;]+)?'
-    ]
-    
-    combined_pattern = re.compile('|'.join(patterns), re.IGNORECASE)
-
-    def replacer(match):
-        raw = match.group(0).strip()
-        
-        # Generer et unikt ID baseret på JV-referencen
-        jv_id = re.sub(r'\s+', '_', raw)  # Erstat mellemrum med underscore
-        jv_id = re.sub(r'[^\w\-_\.]', '', jv_id)  # Fjern specielle tegn undtagen punktum, bindestreg og underscore
-        jv_id = jv_id.lower()  # Konverter til små bogstaver
-        
-        # Generer link URL til den relevante JV-bestemmelse
-        # Udtræk år og sektion fra referencen
-        year_match = re.search(r'(\d{4})-(\d+)', raw)
-        section_match = re.search(r'([A-Z]\.[A-Z](?:\.[A-Z])*)', raw, re.IGNORECASE)
-        
-        link_url = ""
-        if year_match and section_match:
-            year = year_match.group(1)
-            version = year_match.group(2)
-            section = section_match.group(1).upper()
-            
-            # Generer link til SKAT's JV (dette kan tilpasses til den faktiske URL-struktur)
-            link_url = f"https://skat.dk/display.aspx?oid={year}-{version}-{section}"
-        
-        return f'<jv id="{jv_id}" link="{link_url}">{raw}</jv>'
-
-    return combined_pattern.sub(replacer, text)
-
-
-
-
-
 def normalize_anchors(raw_text: str) -> Tuple[str, str, List[Dict[str, Any]], List[str]]:
     """Returnér (text_with_anchors, text_plain, anchor_positions, note_ids)."""
     # FIX: Ingen line-vis stripping - det sker allerede i parse-trinnet
@@ -425,9 +352,6 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             eff_stk = ctx["stk"]
             level = "nr" if ctx["nr"] is not None else ("stk" if ctx["stk"] is not None else "paragraf")
         twa, tp, apos, nids = normalize_anchors(body)
-        # Tilføj dom-tags og JV-tags til begge tekstfelter
-        twa_tagged = tag_jv_referencer(tag_domsreferencer(twa))
-        tp_tagged = tag_jv_referencer(tag_domsreferencer(tp))
         chunks.append({
             "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
             "chunk_id": make_chunk_id(ctx["paragraf"], eff_stk, ctx["nr"], section=None),
@@ -436,8 +360,8 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             "paragraf": ctx["paragraf"],
             "stk": eff_stk,
             "nr": ctx["nr"],
-            "text_with_anchors": twa_tagged,
-            "text_plain": tp_tagged,
+            "text_with_anchors": twa,
+            "text_plain": tp,
             "anchor_positions": apos,
             "note_refs": nids,
             "note_uuids": [],  # Vil blive udfyldt senere
@@ -457,17 +381,14 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             ctx.update({"section": current_section_label, "paragraf": None, "stk": None, "nr": None, "buf": []})
             # selve overskriften som chunk (level=afsnit)
             twa, tp, apos, nids = normalize_anchors(current_section_label)
-            # Tilføj dom-tags og JV-tags til begge tekstfelter
-            twa_tagged = tag_jv_referencer(tag_domsreferencer(twa))
-            tp_tagged = tag_jv_referencer(tag_domsreferencer(tp))
             chunks.append({
                 "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
                 "chunk_id": make_chunk_id(None, section=current_section_label),
                 "level": "afsnit",
                 "section_label": current_section_label,
                 "paragraf": None, "stk": None, "nr": None,
-                "text_with_anchors": twa_tagged,
-                "text_plain": tp_tagged,
+                "text_with_anchors": twa,
+                "text_plain": tp,
                 "anchor_positions": apos,
                 "note_refs": nids,
                 "note_uuids": [],
@@ -486,17 +407,14 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
                 # paragraf_intro som eget chunk - FIX: Ren tekst uden § label
                 clean_tail = strip_structural_markers(tail, "body")  # Kun fjern markdown
                 twa, tp, apos, nids = normalize_anchors(clean_tail)
-                # Tilføj dom-tags og JV-tags til begge tekstfelter
-                twa_tagged = tag_jv_referencer(tag_domsreferencer(twa))
-                tp_tagged = tag_jv_referencer(tag_domsreferencer(tp))
                 chunks.append({
                     "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
                     "chunk_id": make_chunk_id(pnum, is_intro=True),  # FIX: Entydigt ID
                     "level": "paragraf_intro",
                     "section_label": current_section_label,
                     "paragraf": pnum, "stk": None, "nr": None,
-                    "text_with_anchors": twa_tagged,
-                    "text_plain": tp_tagged,
+                    "text_with_anchors": twa,
+                    "text_plain": tp,
                     "anchor_positions": apos,
                     "note_refs": nids,
                     "note_uuids": [],
@@ -537,15 +455,13 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
     for nid, ntext in note_bodies.items():
         note_uuid = generate_chunk_uuid()
         note_uuid_map[nid] = note_uuid
-        # Tilføj dom-tags og JV-tags til note tekst
-        ntext_tagged = tag_jv_referencer(tag_domsreferencer(ntext))
         chunks.append({
             "uuid": note_uuid,
             "chunk_id": f"note({nid})",
             "level": "note",
             "section_label": None,
             "paragraf": None, "stk": None, "nr": None,
-            "text_plain": ntext_tagged,
+            "text_plain": ntext,
             "referenced_by": [],  # Vil blive udfyldt senere
         })
 
@@ -782,9 +698,6 @@ def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
 
     # FIX: Post-tjek for ellipser
     text_plain = clean_ellipses_from_text(text_plain)
-    
-    # Tilføj dom-tags og JV-tags til tekst
-    text_plain_tagged = tag_jv_referencer(tag_domsreferencer(text_plain))
 
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
@@ -792,8 +705,8 @@ def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
         "level": "stk_parent",
         "section_label": nr_children[0].get("section_label"),
         "paragraf": p, "stk": s, "nr": None,
-        "text_with_anchors": text_plain_tagged,   # same as plain (ingen ankre i parent)
-        "text_plain": text_plain_tagged,
+        "text_with_anchors": text_plain,   # same as plain (ingen ankre i parent)
+        "text_plain": text_plain,
         "anchor_positions": [],
         "note_refs": [],
         "note_uuids": [],
@@ -872,9 +785,6 @@ def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
 
     # FIX: Post-tjek for ellipser
     text_plain = clean_ellipses_from_text(text_plain)
-    
-    # Tilføj dom-tags og JV-tags til tekst
-    text_plain_tagged = tag_jv_referencer(tag_domsreferencer(text_plain))
 
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
@@ -882,8 +792,8 @@ def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
         "level": "paragraf_parent",
         "section_label": section_label,
         "paragraf": p, "stk": None, "nr": None,
-        "text_with_anchors": text_plain_tagged,
-        "text_plain": text_plain_tagged,
+        "text_with_anchors": text_plain,
+        "text_plain": text_plain,
         "anchor_positions": [],
         "note_refs": [],
         "note_uuids": [],
@@ -933,9 +843,6 @@ def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
 
     # FIX: Post-tjek for ellipser
     text_plain = clean_ellipses_from_text(text_plain)
-    
-    # Tilføj dom-tags og JV-tags til tekst
-    text_plain_tagged = tag_jv_referencer(tag_domsreferencer(text_plain))
 
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
@@ -943,8 +850,8 @@ def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
         "level": "section_parent",
         "section_label": section_label,
         "paragraf": None, "stk": None, "nr": None,
-        "text_with_anchors": text_plain_tagged,
-        "text_plain": text_plain_tagged,
+        "text_with_anchors": text_plain,
+        "text_plain": text_plain,
         "anchor_positions": [],
         "note_refs": [],
         "note_uuids": [],
@@ -972,9 +879,6 @@ def clean_note_chunk_fields(chunks: List[Dict[str, Any]]) -> None:
             for field in fields_to_remove:
                 if field in chunk:
                     del chunk[field]
-
-
-
 
 
 def write_csv(path: str, rows: List[Dict[str, Any]]):
