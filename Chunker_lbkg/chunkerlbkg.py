@@ -139,6 +139,12 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
         original_id = part_chunk.get("chunk_id", "")
         part_chunk["chunk_id"] = f"{original_id} (part {i+1})"
         
+        # Opdater atom_id med part-info
+        original_atom_id = part_chunk.get("atom_id", "")
+        if original_atom_id:
+            # Tilføj part-info til slutningen af atom_id
+            part_chunk["atom_id"] = f"{original_atom_id}--part{i+1}-of-{len(text_parts)}"
+        
         # Filtrer metadata baseret på position
         def filter_metadata_by_position(metadata_list: List[Dict], start: int, end: int) -> List[Dict]:
             filtered = []
@@ -151,9 +157,10 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
                     filtered.append(new_item)
             return filtered
         
-        # Fordel metadata (note_anchors skal genberegnes for split-dele)
-        # For nu sættes de til tom - kan implementeres senere når split aktiveres
-        part_chunk["note_anchors"] = []
+        # Fordel metadata med korrekt positions-filtrering
+        part_chunk["note_anchors"] = filter_metadata_by_position(
+            original_chunk.get("note_anchors", []), part_start, part_end
+        )
         part_chunk["dom_refs"] = filter_metadata_by_position(
             original_chunk.get("dom_refs", []), part_start, part_end
         )
@@ -178,32 +185,35 @@ def split_chunk_by_tokens(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[s
     if not should_split_chunk(text, max_tokens):
         return [chunk]
     
-    # PLACEHOLDER: Deaktiveret indtil videre
-    print(f"⚠️  Split-funktionalitet er forberedt men ikke aktiveret. Chunk {chunk.get('chunk_id')} har {estimate_tokens(text)} tokens.")
-    return [chunk]
+    # AKTIVERET: Split-funktionalitet med hård token-grænse
+    split_points = find_split_points(text, max_tokens)
     
-    # FRAMEWORK KLAR TIL AKTIVERING:
-    # split_points = find_split_points(text, max_tokens)
-    # 
-    # if not split_points:
-    #     return [chunk]
-    # 
-    # # Split teksten
-    # text_parts = []
-    # last_pos = 0
-    # 
-    # for split_pos in split_points:
-    #     text_parts.append(text[last_pos:split_pos].strip())
-    #     last_pos = split_pos
-    # 
-    # # Tilføj sidste del
-    # text_parts.append(text[last_pos:].strip())
-    # 
-    # # Fjern tomme dele
-    # text_parts = [part for part in text_parts if part.strip()]
-    # 
-    # # Generer split-chunks med korrekt metadata-fordeling
-    # return redistribute_metadata(chunk, text_parts)
+    if not split_points:
+        return [chunk]
+    
+    print(f"🔄 Splitting chunk {chunk.get('chunk_id')} ({estimate_tokens(text)} tokens) into parts...")
+    
+    # Split teksten
+    text_parts = []
+    last_pos = 0
+    
+    for split_pos in split_points:
+        text_parts.append(text[last_pos:split_pos].strip())
+        last_pos = split_pos
+    
+    # Tilføj sidste del
+    text_parts.append(text[last_pos:].strip())
+    
+    # Fjern tomme dele
+    text_parts = [part for part in text_parts if part.strip()]
+    
+    if len(text_parts) <= 1:
+        return [chunk]  # Ingen effektiv split
+    
+    # Generer split-chunks med korrekt metadata-fordeling
+    split_chunks = redistribute_metadata(chunk, text_parts)
+    print(f"✅ Split into {len(split_chunks)} parts")
+    return split_chunks
 
 # ------------------------------
 # LLM Integration
@@ -535,8 +545,65 @@ def extract_note_anchors(original_text: str, clean_text: str) -> List[Dict[str, 
 
 
 
+def normalize_coordinate(value: str) -> str:
+    """Normalisér koordinat-værdi til atom_id format: små bogstaver, ingen mellemrum."""
+    if not value:
+        return ""
+    # Fjern mellemrum og konverter til små bogstaver: "33 A" → "33a", "10 a)" → "10a"
+    normalized = re.sub(r'[^\w]', '', value).lower()
+    return normalized
+
+
+def make_atom_id(law_id: str, paragraf: Optional[str] = None, stk: Optional[str] = None, 
+                 nr: Optional[str] = None, lit: Optional[str] = None, pkt: Optional[str] = None,
+                 part_info: Optional[tuple] = None, kind: str = "rule", 
+                 note_id: Optional[str] = None, section: Optional[str] = None) -> str:
+    """Generér deterministisk atom_id efter formatet:
+    law_id--§par--stkstk--nrnr--litlit--pktpkt--parti-of-n--noteN
+    (kind gemmes som separat metadata-felt)
+    """
+    parts = [law_id]
+    
+    # Section-baserede chunks (afsnit/kapitel)
+    if section and not paragraf:
+        # For section chunks: law_id--section<normalized>
+        section_norm = normalize_coordinate(section.replace(" ", "_"))
+        parts.append(f"section{section_norm}")
+        return "--".join(parts)
+    
+    # Paragraf-baserede chunks
+    if paragraf:
+        parts.append(f"§{normalize_coordinate(paragraf)}")
+        
+        # Implicit stk. 1 materialiseres
+        if stk:
+            parts.append(f"stk{normalize_coordinate(stk)}")
+        elif nr or kind in ["rule", "definition"]:  # Kun materialisér hvis der er indhold
+            parts.append("stk1")
+            
+        if nr:
+            parts.append(f"nr{normalize_coordinate(nr)}")
+            
+        if lit:
+            parts.append(f"lit{normalize_coordinate(lit)}")
+            
+        if pkt:
+            parts.append(f"pkt{normalize_coordinate(pkt)}")
+    
+    # Split-information
+    if part_info and len(part_info) == 2:
+        i, total = part_info
+        parts.append(f"part{i}-of-{total}")
+    
+    # Note-specifik information
+    if note_id:
+        parts.append(f"note{note_id}")
+    
+    return "--".join(parts)
+
+
 def make_chunk_id(paragraf: Optional[str], stk: Optional[str] = None, nr: Optional[str] = None,
-                  *, section: Optional[str] = None, parent_label: Optional[str] = None, is_intro: bool = False) -> str:
+                  *, section: Optional[str] = None, parent_label: Optional[str] = None) -> str:
     if section is not None:
         base = f"{section}"
         if parent_label:
@@ -546,9 +613,7 @@ def make_chunk_id(paragraf: Optional[str], stk: Optional[str] = None, nr: Option
     if paragraf:
         parts.append(f"§ {paragraf}")
     
-    # FIX: Entydige IDs for intro og parent
-    if is_intro:
-        return (', '.join(parts) + " (intro)") if parts else 'root'
+    # FIX: Entydige IDs for parent
     if parent_label == 'paragraf_parent':
         return (', '.join(parts) + " (parent)") if parts else 'root'
     
@@ -626,9 +691,31 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         # Udtræk note_ids for kompatibilitet
         note_ids = [anchor["note_id"] for anchor in note_anchors]
         
+        # Bestem kind baseret på level og indhold
+        if level == "nr":
+            kind = "rule"
+        elif level == "stk":
+            kind = "rule"
+        elif level == "paragraf":
+            kind = "rule"
+        else:
+            kind = "rule"  # Default
+        
+        # Generér atom_id
+        law_id = "KSL_2025-04-11_nr460"  # Fast for denne lov
+        atom_id = make_atom_id(
+            law_id=law_id,
+            paragraf=ctx["paragraf"],
+            stk=eff_stk,
+            nr=ctx["nr"],
+            kind=kind
+        )
+        
         chunks.append({
             "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
             "chunk_id": make_chunk_id(ctx["paragraf"], eff_stk, ctx["nr"], section=None),
+            "atom_id": atom_id,  # Ny deterministisk ID
+            "kind": kind,  # Ny atomtype
             "level": level,
             "section_label": ctx["section"],
             "paragraf": ctx["paragraf"],
@@ -670,9 +757,19 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             # Udtræk note_ids for kompatibilitet
             note_ids = [anchor["note_id"] for anchor in note_anchors]
             
+            # Section chunks er af type "section"
+            law_id = "KSL_2025-04-11_nr460"
+            atom_id = make_atom_id(
+                law_id=law_id,
+                section=current_section_label,
+                kind="section"
+            )
+            
             chunks.append({
                 "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
                 "chunk_id": make_chunk_id(None, section=current_section_label),
+                "atom_id": atom_id,  # Ny deterministisk ID
+                "kind": "section",  # Ny atomtype
                 "level": "afsnit",
                 "section_label": current_section_label,
                 "paragraf": None, "stk": None, "nr": None,
@@ -698,37 +795,10 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             ctx.update({"paragraf": pnum, "stk": None, "nr": None, "buf": []})
             tail = tail.strip()
             if tail:
-                # paragraf_intro som eget chunk - FIX: Ren tekst uden § label
+                # Behandl som implicit stk. 1 i stedet for paragraf_intro
+                ctx["stk"] = "1"  # Sæt implicit stk. 1
                 clean_tail = strip_structural_markers(tail, "body")  # Kun fjern markdown
-                
-                # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
-                text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', clean_tail).strip()
-                
-                # Udtræk metadata med korrekte positioner
-                note_anchors = extract_note_anchors(clean_tail, text_plain)
-                dom_refs = extract_dom_references(text_plain)
-                jv_refs = extract_jv_references(text_plain)
-                
-                # Udtræk note_ids for kompatibilitet
-                note_ids = [anchor["note_id"] for anchor in note_anchors]
-                
-                chunks.append({
-                    "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
-                    "chunk_id": make_chunk_id(pnum, is_intro=True),  # FIX: Entydigt ID
-                    "level": "paragraf_intro",
-                    "section_label": current_section_label,
-                    "paragraf": pnum, "stk": None, "nr": None,
-                    "text_plain": text_plain,
-                    "note_anchors": note_anchors,
-                    "dom_refs": dom_refs,
-                    "jv_refs": jv_refs,
-                    "note_refs": note_ids,
-                    "note_uuids": [],
-                    # Split-ready struktur (klar til aktivering)
-                    "part_index": 1,
-                    "part_total": 1,
-                    "split_reason": None,
-                })
+                ctx["buf"] = [clean_tail] if clean_tail else []
             continue
         
         # Stk.
@@ -774,9 +844,19 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         dom_refs = extract_dom_references(text_plain)
         jv_refs = extract_jv_references(text_plain)
         
+        # Note chunks er af type "note"
+        law_id = "KSL_2025-04-11_nr460"
+        atom_id = make_atom_id(
+            law_id=law_id,
+            kind="note",
+            note_id=nid
+        )
+        
         chunks.append({
             "uuid": note_uuid,
             "chunk_id": f"note({nid})",
+            "atom_id": atom_id,  # Ny deterministisk ID
+            "kind": "note",  # Ny atomtype
             "level": "note",
             "section_label": None,
             "paragraf": None, "stk": None, "nr": None,
@@ -1013,9 +1093,20 @@ def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
     dom_refs = extract_dom_references(text_plain_clean)
     jv_refs = extract_jv_references(text_plain_clean)
 
+    # Parent chunks er af type "parent"
+    law_id = "KSL_2025-04-11_nr460"
+    atom_id = make_atom_id(
+        law_id=law_id,
+        paragraf=p,
+        stk=s,
+        kind="parent"
+    )
+    
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
         "chunk_id": make_chunk_id(p, s, None, parent_label='stk_parent'),
+        "atom_id": atom_id,  # Ny deterministisk ID
+        "kind": "parent",  # Ny atomtype
         "level": "stk_parent",
         "section_label": nr_children[0].get("section_label"),
         "paragraf": p, "stk": s, "nr": None,
@@ -1113,9 +1204,19 @@ def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
     dom_refs = extract_dom_references(text_plain_clean)
     jv_refs = extract_jv_references(text_plain_clean)
 
+    # Parent chunks er af type "parent"
+    law_id = "KSL_2025-04-11_nr460"
+    atom_id = make_atom_id(
+        law_id=law_id,
+        paragraf=p,
+        kind="parent"
+    )
+    
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
         "chunk_id": make_chunk_id(p, parent_label='paragraf_parent'),
+        "atom_id": atom_id,  # Ny deterministisk ID
+        "kind": "parent",  # Ny atomtype
         "level": "paragraf_parent",
         "section_label": section_label,
         "paragraf": p, "stk": None, "nr": None,
@@ -1184,9 +1285,19 @@ def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
     dom_refs = extract_dom_references(text_plain_clean)
     jv_refs = extract_jv_references(text_plain_clean)
 
+    # Parent chunks er af type "parent"
+    law_id = "KSL_2025-04-11_nr460"
+    atom_id = make_atom_id(
+        law_id=law_id,
+        section=section_label,
+        kind="parent"
+    )
+    
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
         "chunk_id": make_chunk_id(None, section=section_label, parent_label='section_parent'),
+        "atom_id": atom_id,  # Ny deterministisk ID
+        "kind": "parent",  # Ny atomtype
         "level": "section_parent",
         "section_label": section_label,
         "paragraf": None, "stk": None, "nr": None,
@@ -1211,9 +1322,16 @@ def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
 # ------------------------------
 
 def write_jsonl(path: str, rows: List[Dict[str, Any]]):
+    """Skriv chunks som JSONL (JSON Lines) - en chunk per linje."""
     with open(path, 'w', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def write_json(path: str, rows: List[Dict[str, Any]]):
+    """Skriv chunks som standard JSON array."""
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
 
 def clean_note_chunk_fields(chunks: List[Dict[str, Any]]) -> None:
@@ -1248,7 +1366,7 @@ def main():
     ap.add_argument('--use-llm-parents', action='store_true', help='Brug LLM til at generere parent chunk bullets')
     ap.add_argument('--fireworks-api-key', help='Fireworks API key (alternativ til miljøvariabel)')
     ap.add_argument('--no-csv', action='store_true', help='Undlad at generere en CSV-fil')
-    ap.add_argument('--max-tokens', type=int, default=None, help='Maksimalt antal tokens per chunk (aktiverer auto-split)')
+    ap.add_argument('--max-tokens', type=int, default=275, help='Maksimalt antal tokens per chunk (standard: 275, sæt til 0 for at deaktivere split)')
     args = ap.parse_args()
 
     in_path = args.input
@@ -1325,8 +1443,8 @@ def main():
     # Ryd op i note-felter før output
     clean_note_chunk_fields(chunks)
     
-    # Split-logik (klar til aktivering)
-    if args.max_tokens:
+    # Split-logik (aktiveret som standard)
+    if args.max_tokens and args.max_tokens > 0:
         print(f"🔧 Token-begrænsning aktiveret: {args.max_tokens} tokens per chunk")
         original_count = len(chunks)
         split_chunks = []
@@ -1343,16 +1461,19 @@ def main():
         chunks = split_chunks
         print(f"📊 Split-resultat: {original_count} → {len(chunks)} chunks")
 
-    # Skriv filer
+    # Skriv filer i begge formater
     jsonl_path = f"{out_prefix}_chunks.jsonl"
+    json_path = f"{out_prefix}_chunks.json"
+    
     write_jsonl(jsonl_path, chunks)
+    write_json(json_path, chunks)
 
     if not args.no_csv:
         csv_path = f"{out_prefix}_chunks.csv"
         # write_csv(csv_path, chunks) # Deaktiveret
-        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} (CSV output er deaktiveret)")
+        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} + {json_path} (CSV output er deaktiveret)")
     else:
-        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path}")
+        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} + {json_path}")
 
 
 if __name__ == '__main__':

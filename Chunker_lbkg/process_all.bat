@@ -1,6 +1,14 @@
 @echo off
 setlocal enabledelayedexpansion
 
+REM --- Chunker Batch Script ---
+REM Kører chunkerlbkg.py på alle .md-filer i input-mappen
+REM 
+REM SPLIT-FUNKTIONALITET:
+REM - Standard: 275 tokens per chunk (aktiveret)
+REM - For at deaktivere: ændr --max-tokens 275 til --max-tokens 0
+REM - For anden grænse: ændr til fx --max-tokens 400
+REM
 REM --- Konfiguration ---
 REM Stierne er nu relative til placeringen af denne batch-fil.
 set SCRIPT_PATH=%~dp0chunkerlbkg.py
@@ -52,8 +60,9 @@ for %%f in ("%INPUT_DIR%\*.md") do (
     REM Definer output-sti
     set "OUTPUT_PREFIX=%OUTPUT_DIR%\!FILENAME!"
 
-    REM Kør Python-scriptet med --no-csv flaget
-    python "%SCRIPT_PATH%" --input "%%f" --out-prefix "!OUTPUT_PREFIX!" --no-csv
+    REM Kør Python-scriptet med split-funktionalitet aktiveret (275 tokens)
+    REM For at deaktivere split: tilføj --max-tokens 0
+    python "%SCRIPT_PATH%" --input "%%f" --out-prefix "!OUTPUT_PREFIX!" --no-csv --max-tokens 275
     
     echo.
 )
