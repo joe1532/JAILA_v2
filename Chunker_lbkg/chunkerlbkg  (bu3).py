@@ -48,10 +48,36 @@ RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', 
 RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.', re.IGNORECASE)
 # FIX: Understøt nr. med bogstav-suffiks (nr. 10 a)
 RE_NR           = re.compile(r'^###\s*(\d+(?:\s*[a-zA-Z]+)?)[\)\.]', re.IGNORECASE)
+# Litra under nr: a), b), c) osv.
+RE_LITRA        = re.compile(r'^####\s*([a-z])[\)\.]', re.IGNORECASE)
+# Punkt under litra: 1., 2., 3. osv.
+RE_PUNKT        = re.compile(r'^#####\s*(\d+)[\)\.]', re.IGNORECASE)
 RE_NOTE_BODY    = re.compile(r'^\(\u200B?(\d+)\u200B?\)\s')   # note‑krop (med zero-width spaces)
 RE_MD_PREFIX    = re.compile(r'^(#+)\s*')
 
 RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')  # inline notehenvisninger (med zero-width spaces)
+
+# Crossrefs patterns - enkle interne henvisninger
+_LAW_CODES = r'(?:KSL|SEL|EBL|AL|LL|ML|SFL|PSL|SSL)'
+RE_CROSSREF_BASIC = re.compile(
+    r'(?:jf\.\s*|se\s*også\s*|jfr\.\s*|efter\s*|i\s*henhold\s*til\s*)?'  # valgfrit præfiks
+    rf'(?:\b{_LAW_CODES}\s*)?'  # valgfrit lov-præfiks (kun kendte koder)
+    r'§\s*(\d+\s*[A-Za-z]?)'  # paragraf (tillad mellemrum før bogstav)
+    r'(?:\s*,\s*stk\.\s*(\d+[A-Za-z]?))?'  # stykke
+    r'(?:\s*,\s*nr\.\s*(\d+[A-Za-z]?))?'  # nummer
+    r'(?:\s*,\s*litra\s*([a-z]))?',  # litra
+    re.IGNORECASE
+)
+RE_CROSSREF_RANGE = re.compile(
+    rf'(?:\b{_LAW_CODES}\s*)?§\s*(\d+\s*[A-Za-z]?)\s*,\s*(stk\.|nr\.)\s*(\d+[A-Za-z]?)\s*[–-]\s*(\d+[A-Za-z]?)',
+    re.IGNORECASE
+)
+RE_CROSSREF_LIST = re.compile(
+    rf'(?:\b{_LAW_CODES}\s*)?§\s*(\d+\s*[A-Za-z]?)\s*,\s*(stk\.|nr\.)\s*'
+    r'(?!litra\b)(?!pkt\b)'
+    r'((?:\d+[A-Za-z]?(?:\s*[–-]\s*\d+[A-Za-z]?)?)(?:\s*,\s*\d+[A-Za-z]?(?:\s*[–-]\s*\d+[A-Za-z]?)?)*(?:\s*og\s*\d+[A-Za-z]?(?:\s*[–-]\s*\d+[A-Za-z]?)?)?)',
+    re.IGNORECASE
+)
 
 ANCHOR_FMT = "⟦{id}⟧"
 
@@ -68,6 +94,147 @@ def normalize_coordinate(value: Optional[str]) -> str:
     if not value:
         return ""
     return re.sub(r'[^0-9A-Za-z]', '', str(value)).lower()
+
+
+def make_crossref_id(law_id: str, par: str, stk: Optional[str] = None,
+                     nr: Optional[str] = None, lit: Optional[str] = None) -> str:
+    parts = [law_id]
+    if par:
+        parts.append(f"par{normalize_coordinate(par)}")
+        if stk:
+            parts.append(f"stk{normalize_coordinate(stk)}")
+        elif nr:
+            parts.append("stk1")
+        if nr:
+            parts.append(f"nr{normalize_coordinate(nr)}")
+        if lit:
+            parts.append(f"lit{normalize_coordinate(lit)}")
+    return "--".join(parts)
+
+
+def parse_coordinate_list(coord_list: str) -> list:
+    cleaned = re.sub(r'\s*og\s*', ',', coord_list.strip())
+    items = [item.strip() for item in cleaned.split(',')]
+    return [i for i in items if i]
+
+
+def expand_range(start: str, end: str) -> list:
+    m1 = re.match(r'^(\d+)([A-Za-z]*)$', start.strip())
+    m2 = re.match(r'^(\d+)([A-Za-z]*)$', end.strip())
+    if not m1 or not m2 or m1.group(2) or m2.group(2):
+        return [start, end]
+    a, b = int(m1.group(1)), int(m2.group(1))
+    if a > b:
+        return [start, end]
+    return [str(i) for i in range(a, b+1)]
+
+
+def extract_crossrefs(text: str, current_law_id: str, current_paragraf: Optional[str] = None) -> list:
+    crossrefs = []
+    last_abs = None  # (par, stk, nr, lit)
+    # basic
+    for m in RE_CROSSREF_BASIC.finditer(text):
+        par, stk, nr, lit = m.groups()
+        target_law = current_law_id
+        last_abs = (par, stk, nr, lit)
+        crossrefs.append({
+            "raw": m.group(0),
+            "start": m.start(),
+            "len": len(m.group(0)),
+            "type": "basic",
+            "target_law": target_law,
+            "paragraf": par,
+            "stk": stk,
+            "nr": nr,
+            "lit": lit,
+            "crossref_id": make_crossref_id(target_law, par, stk, nr, lit)
+        })
+    # ranges
+    for m in RE_CROSSREF_RANGE.finditer(text):
+        par, typ, a, b = m.groups()
+        target_law = current_law_id
+        for val in expand_range(a, b):
+            if typ.lower() == 'stk.':
+                cr_id = make_crossref_id(target_law, par, val)
+                cr = {"paragraf": par, "stk": val, "nr": None}
+            else:
+                cr_id = make_crossref_id(target_law, par, '1', val)
+                cr = {"paragraf": par, "stk": '1', "nr": val}
+            crossrefs.append({
+                "raw": m.group(0),
+                "start": m.start(),
+                "len": len(m.group(0)),
+                "type": "range",
+                "target_law": target_law,
+                **cr,
+                "lit": None,
+                "crossref_id": cr_id
+            })
+    # lists
+    for m in RE_CROSSREF_LIST.finditer(text):
+        par, typ, lst = m.groups()
+        target_law = current_law_id
+        items = parse_coordinate_list(lst)
+        expanded = []
+        for it in items:
+            if re.search(r'[–-]', it):
+                a, b = [p.strip() for p in re.split(r'[–-]', it, maxsplit=1)]
+                expanded.extend(expand_range(a, b))
+            else:
+                expanded.append(it)
+        for val in expanded:
+            if typ.lower() == 'stk.':
+                cr_id = make_crossref_id(target_law, par, val)
+                cr = {"paragraf": par, "stk": val, "nr": None}
+            else:
+                cr_id = make_crossref_id(target_law, par, '1', val)
+                cr = {"paragraf": par, "stk": '1', "nr": val}
+            crossrefs.append({
+                "raw": m.group(0),
+                "start": m.start(),
+                "len": len(m.group(0)),
+                "type": "list",
+                "target_law": target_law,
+                **cr,
+                "lit": None,
+                "crossref_id": cr_id
+            })
+    # relative jf. stk. X (samme paragraf)
+    rel_pat = re.compile(r'(?:jf\.\s*|se\s*)?stk\.\s*(\d+[A-Za-z]?)', re.IGNORECASE)
+    for m in rel_pat.finditer(text):
+        ref_stk = m.group(1)
+        # Bind til seneste absolut reference hvis findes; ellers til current_paragraf
+        if last_abs and last_abs[0]:
+            par = last_abs[0]
+            target_law = current_law_id
+        elif current_paragraf:
+            par = current_paragraf
+            target_law = current_law_id
+        else:
+            continue
+        cr_id = make_crossref_id(target_law, par, ref_stk)
+        crossrefs.append({
+            "raw": m.group(0),
+            "start": m.start(),
+            "len": len(m.group(0)),
+            "type": "relative",
+            "target_law": target_law,
+            "paragraf": par,
+            "stk": ref_stk,
+            "nr": None,
+            "lit": None,
+            "crossref_id": cr_id
+        })
+    # dedup by crossref_id while keeping first occurrence
+    seen = set()
+    dedup = []
+    for cr in crossrefs:
+        cid = cr.get("crossref_id")
+        if cid in seen:
+            continue
+        seen.add(cid)
+        dedup.append(cr)
+    return dedup
 
 
 def auto_derive_law_id(filename: str) -> str:
@@ -390,6 +557,12 @@ def strip_structural_markers(line: str, line_type: str = "body") -> str:
     elif line_type == "nr":
         # Fjern: ### 10 a) → bevar resten
         return re.sub(r'^###\s*\d+(?:\s*[a-zA-Z]+)?[\)\.]?\s*', '', line).strip()
+    elif line_type == "litra":
+        # Fjern: #### a) → bevar resten
+        return re.sub(r'^####\s*[a-z][\)\.]?\s*', '', line, flags=re.IGNORECASE).strip()
+    elif line_type == "punkt":
+        # Fjern: ##### 1. → bevar resten
+        return re.sub(r'^#####\s*\d+[\)\.]?\s*', '', line).strip()
     else:
         # Brødtekst: fjern kun markdown #
         return strip_md(line)
@@ -690,7 +863,7 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
 
     # 2) Struktur‑parse
     chunks: List[Dict[str, Any]] = []
-    ctx = {"section": None, "paragraf": None, "stk": None, "nr": None, "buf": []}
+    ctx = {"section": None, "paragraf": None, "stk": None, "nr": None, "litra": None, "pkt": None, "buf": []}
 
     def flush_chunk() -> None:
         body = ' '.join(ctx["buf"]).strip()
@@ -712,7 +885,12 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             level = "stk"
         else:
             eff_stk = ctx["stk"]
-            level = "nr" if ctx["nr"] is not None else ("stk" if ctx["stk"] is not None else "paragraf")
+            if ctx.get("pkt"):
+                level = "pkt"
+            elif ctx.get("litra"):
+                level = "litra"
+            else:
+                level = "nr" if ctx["nr"] is not None else ("stk" if ctx["stk"] is not None else "paragraf")
         kind = "rule"
         # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
         text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', body).strip()
@@ -722,6 +900,10 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
         dom_refs = extract_dom_references(text_plain)
         jv_refs = extract_jv_references(text_plain)
         
+        # Udtræk crossrefs
+        crossrefs = extract_crossrefs(text_plain, law_id, ctx["paragraf"])
+        crossref_ids = [c["crossref_id"] for c in crossrefs]
+
         # Udtræk note_ids for kompatibilitet
         note_ids = [anchor["note_id"] for anchor in note_anchors]
         
@@ -731,6 +913,8 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             par=ctx["paragraf"],
             stk=eff_stk,
             nr=ctx["nr"],
+            lit=ctx.get("litra"),
+            pkt=ctx.get("pkt"),
             kind=kind
         )
         atom_id = make_atom_id(
@@ -738,6 +922,8 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             par=ctx["paragraf"],
             stk=eff_stk,
             nr=ctx["nr"],
+            lit=ctx.get("litra"),
+            pkt=ctx.get("pkt"),
             kind=kind
         )
 
@@ -755,12 +941,14 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             "par": ctx["paragraf"],
             "stk": eff_stk,
             "nr": ctx["nr"],
-            "litra": None,
-            "pkt": None,
+            "litra": ctx.get("litra"),
+            "pkt": ctx.get("pkt"),
             "text_plain": text_plain,
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
             "jv_refs": jv_refs,
+            "crossrefs": crossrefs,
+            "crossref_ids": crossref_ids,
             "note_refs": note_ids,  # Bevar for kompatibilitet
             "note_uuids": [],  # Vil blive udfyldt senere
             # Split-ready struktur (klar til aktivering)
@@ -780,7 +968,7 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             flush_chunk()
             section_type, section_title = m_sec.groups()
             current_section_label = f"{section_type} {section_title}"
-            ctx.update({"section": current_section_label, "paragraf": None, "stk": None, "nr": None, "buf": []})
+            ctx.update({"section": current_section_label, "paragraf": None, "stk": None, "nr": None, "litra": None, "pkt": None, "buf": []})
             # selve overskriften som chunk (level=afsnit)
             # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
             text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', current_section_label).strip()
@@ -790,6 +978,10 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             dom_refs = extract_dom_references(text_plain)
             jv_refs = extract_jv_references(text_plain)
             
+            # Udtræk crossrefs
+            crossrefs = extract_crossrefs(text_plain, law_id)
+            crossref_ids = [c["crossref_id"] for c in crossrefs]
+
             # Udtræk note_ids for kompatibilitet
             note_ids = [anchor["note_id"] for anchor in note_anchors]
             
@@ -812,6 +1004,8 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
                 "note_anchors": note_anchors,
                 "dom_refs": dom_refs,
                 "jv_refs": jv_refs,
+                "crossrefs": crossrefs,
+                "crossref_ids": crossref_ids,
                 "note_refs": note_ids,
                 "note_uuids": [],
                 # Split-ready struktur (klar til aktivering)
@@ -826,41 +1020,13 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
         if m_p:
             flush_chunk()
             pnum, tail = m_p.groups()
-            # DEBUG: print(f"🔍 Found paragraf: '{pnum}' (from line: {raw[:50]}...)")
-            ctx.update({"paragraf": pnum, "stk": None, "nr": None, "buf": []})
+            ctx.update({"paragraf": pnum, "stk": None, "nr": None, "litra": None, "pkt": None, "buf": []})
             tail = tail.strip()
             if tail:
-                # paragraf_intro som eget chunk - FIX: Ren tekst uden § label
-                clean_tail = strip_structural_markers(tail, "body")  # Kun fjern markdown
-                
-                # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
-                text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', clean_tail).strip()
-                
-                # Udtræk metadata med korrekte positioner
-                note_anchors = extract_note_anchors(clean_tail, text_plain)
-                dom_refs = extract_dom_references(text_plain)
-                jv_refs = extract_jv_references(text_plain)
-                
-                # Udtræk note_ids for kompatibilitet
-                note_ids = [anchor["note_id"] for anchor in note_anchors]
-                
-                chunks.append({
-                    "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
-                    "chunk_id": make_chunk_id(pnum, is_intro=True),  # FIX: Entydigt ID
-                    "level": "paragraf_intro",
-                    "section_label": current_section_label,
-                    "paragraf": pnum, "stk": None, "nr": None,
-                    "text_plain": text_plain,
-                    "note_anchors": note_anchors,
-                    "dom_refs": dom_refs,
-                    "jv_refs": jv_refs,
-                    "note_refs": note_ids,
-                    "note_uuids": [],
-                    # Split-ready struktur (klar til aktivering)
-                    "part_index": 1,
-                    "part_total": 1,
-                    "split_reason": None,
-                })
+                # Materialisér paragraf-intro som stk. 1 brødtekst
+                clean_tail = strip_structural_markers(tail, "body")
+                ctx["stk"] = "1"
+                ctx["buf"] = [clean_tail] if clean_tail else []
             continue
         
         # Stk.
@@ -871,7 +1037,7 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             # DEBUG: print(f"🔍 Found stk: '{s}' (from line: {raw[:50]}...)")
             # FIX: Brug strip_structural_markers for ren tekst
             clean_text = strip_structural_markers(raw, "stk")
-            ctx.update({"stk": s, "nr": None, "buf": [clean_text] if clean_text else []})
+            ctx.update({"stk": s, "nr": None, "litra": None, "pkt": None, "buf": [clean_text] if clean_text else []})
             continue
         
         # Nr.
@@ -884,7 +1050,30 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             # DEBUG: print(f"🔍 Found nr: '{n}' (from line: {raw[:50]}...)")
             # FIX: Brug strip_structural_markers for ren tekst
             clean_text = strip_structural_markers(raw, "nr")
-            ctx.update({"nr": n, "buf": [clean_text] if clean_text else []})
+            ctx.update({"nr": n, "litra": None, "pkt": None, "buf": [clean_text] if clean_text else []})
+            continue
+
+        # Litra (under nr)
+        m_l = RE_LITRA.match(raw)
+        if m_l:
+            flush_chunk()
+            if ctx["stk"] is None: ctx["stk"] = "1"
+            if ctx["nr"] is None: ctx["nr"] = "1"
+            l = m_l.group(1).lower()
+            clean_text = strip_structural_markers(raw, "litra")
+            ctx.update({"litra": l, "pkt": None, "buf": [clean_text] if clean_text else []})
+            continue
+
+        # Punkt (under litra)
+        m_pu = RE_PUNKT.match(raw)
+        if m_pu:
+            flush_chunk()
+            if ctx["stk"] is None: ctx["stk"] = "1"
+            if ctx["nr"] is None: ctx["nr"] = "1"
+            if ctx["litra"] is None: ctx["litra"] = "a"
+            pval = m_pu.group(1)
+            clean_text = strip_structural_markers(raw, "punkt")
+            ctx.update({"pkt": pval, "buf": [clean_text] if clean_text else []})
             continue
         
         # Akkumuler brødtekst - FIX: Brug strip_structural_markers for ren tekst
@@ -905,6 +1094,8 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
         note_anchors = extract_note_anchors(ntext, text_plain)
         dom_refs = extract_dom_references(text_plain)
         jv_refs = extract_jv_references(text_plain)
+        crossrefs = extract_crossrefs(text_plain, law_id)
+        crossref_ids = [c["crossref_id"] for c in crossrefs]
         
         # IDs for notes (without coordinate context initially)
         note_atom_base_id = make_atom_base_id(law_id=law_id, kind="note", note_id=nid)
@@ -925,6 +1116,8 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
             "jv_refs": jv_refs,
+            "crossrefs": crossrefs,
+            "crossref_ids": crossref_ids,
             "referenced_by": [],  # Vil blive udfyldt senere
             # Split-ready struktur (klar til aktivering)
             "note_id": int(nid),  # Stabil note-id som int
@@ -987,6 +1180,24 @@ def apply_note_context(chunks: List[Dict[str, Any]]) -> None:
                     chunk["paragraf"] = parent_chunk.get("paragraf") 
                     chunk["stk"] = parent_chunk.get("stk")
                     chunk["nr"] = parent_chunk.get("nr")
+
+def update_note_atom_ids_with_context(chunks: List[Dict[str, Any]], law_id: str) -> None:
+    """Når noter har fået kontekst, opdater deres atom_id/atom_base_id til koord-baseret form."""
+    for ch in chunks:
+        if ch.get("level") != "note":
+            continue
+        par = ch.get("paragraf")
+        stk = ch.get("stk")
+        nr = ch.get("nr")
+        nid = str(ch.get("note_id")) if ch.get("note_id") is not None else None
+        if not par or not nid:
+            continue
+        # Synkronisér visningsfeltet 'par' med 'paragraf' (rå værdi som i øvrige chunks)
+        ch["par"] = par
+        new_base = make_atom_base_id(law_id=law_id, par=par, stk=stk, nr=nr, kind="note", note_id=nid)
+        new_id = make_atom_id(law_id=law_id, par=par, stk=stk, nr=nr, kind="note", note_id=nid)
+        ch["atom_base_id"] = new_base
+        ch["atom_id"] = new_id
 
 
 def clean_orphaned_note_references(chunks: List[Dict[str, Any]], note_uuid_map: Dict[str, str]) -> None:
@@ -1109,6 +1320,7 @@ def build_anchor_map_from_children(children: List[Dict[str, Any]]) -> Dict[str, 
 
 def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
                     paragraf_intro_c: Optional[Dict[str, Any]], 
+                    law_id: str,
                     use_llm: bool = False, llm=None) -> Optional[Dict[str, Any]]:
     # find nr‑børn
     nr_children = collect_children(chunks, p, s)
@@ -1154,12 +1366,21 @@ def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
     dom_refs = extract_dom_references(text_plain_clean)
     jv_refs = extract_jv_references(text_plain_clean)
 
+    # IDs for parent
+    atom_base_id = make_atom_base_id(law_id=law_id, par=p, stk=s, kind="parent")
+    atom_id = make_atom_id(law_id=law_id, par=p, stk=s, kind="parent")
+
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
         "chunk_id": make_chunk_id(p, s, None, parent_label='stk_parent'),
+        "law_id": law_id,
+        "atom_id": atom_id,
+        "atom_base_id": atom_base_id,
+        "kind": "parent",
+        "embeddable": False,
         "level": "stk_parent",
         "section_label": nr_children[0].get("section_label"),
-        "paragraf": p, "stk": s, "nr": None,
+        "paragraf": p, "par": p, "stk": s, "nr": None, "litra": None, "pkt": None,
         "text_plain": text_plain_clean,
         "note_anchors": note_anchors,
         "dom_refs": dom_refs,
@@ -1178,7 +1399,8 @@ def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
 
 
 def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
-                         paragraf_intro_c: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+                         paragraf_intro_c: Optional[Dict[str, Any]],
+                         law_id: str) -> Optional[Dict[str, Any]]:
     # find stk‑børn (brug stk_parent hvis den senere tilføjes; ellers stk)
     all_stk_candidates = [c for c in chunks if c.get("paragraf") == p and c.get("level") in ("stk_parent", "stk") and c.get("nr") is None]
     if not all_stk_candidates:
@@ -1254,12 +1476,21 @@ def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
     dom_refs = extract_dom_references(text_plain_clean)
     jv_refs = extract_jv_references(text_plain_clean)
 
+    # IDs for parent
+    atom_base_id = make_atom_base_id(law_id=law_id, par=p, kind="parent")
+    atom_id = make_atom_id(law_id=law_id, par=p, kind="parent")
+
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
         "chunk_id": make_chunk_id(p, parent_label='paragraf_parent'),
+        "law_id": law_id,
+        "atom_id": atom_id,
+        "atom_base_id": atom_base_id,
+        "kind": "parent",
+        "embeddable": False,
         "level": "paragraf_parent",
         "section_label": section_label,
-        "paragraf": p, "stk": None, "nr": None,
+        "paragraf": p, "par": p, "stk": None, "nr": None, "litra": None, "pkt": None,
         "text_plain": text_plain_clean,
         "note_anchors": note_anchors,
         "dom_refs": dom_refs,
@@ -1278,7 +1509,8 @@ def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
 
 def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
                         paragrafs_in_section: List[str],
-                        paragraf_intro: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+                        paragraf_intro: Dict[str, Dict[str, Any]],
+                        law_id: str) -> Optional[Dict[str, Any]]:
     if not paragrafs_in_section:
         return None
     bullets = []
@@ -1325,12 +1557,21 @@ def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
     dom_refs = extract_dom_references(text_plain_clean)
     jv_refs = extract_jv_references(text_plain_clean)
 
+    # IDs for section parent
+    atom_base_id = make_atom_base_id(law_id=law_id, section=section_label, kind="parent")
+    atom_id = make_atom_id(law_id=law_id, section=section_label, kind="parent")
+
     return {
         "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
         "chunk_id": make_chunk_id(None, section=section_label, parent_label='section_parent'),
+        "law_id": law_id,
+        "atom_id": atom_id,
+        "atom_base_id": atom_base_id,
+        "kind": "parent",
+        "embeddable": False,
         "level": "section_parent",
         "section_label": section_label,
-        "paragraf": None, "stk": None, "nr": None,
+        "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
         "text_plain": text_plain_clean,
         "note_anchors": note_anchors,
         "dom_refs": dom_refs,
@@ -1360,6 +1601,90 @@ def write_json(path: str, rows: List[Dict[str, Any]]):
     """Skriv chunks som standard JSON array."""
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
+
+# ------------------------------
+# Rydning før QA
+# ------------------------------
+
+def cleanup_before_qa(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned = []
+    seen_ids = set()
+    for c in chunks:
+        # Drop regel-chunks uden paragraf (støj fra metadata/root)
+        if c.get('kind') == 'rule' and not c.get('paragraf'):
+            safe_print(f"[CLEANUP] Dropping rule without paragraf: {c.get('chunk_id')}")
+            continue
+        aid = c.get('atom_id')
+        if aid and aid in seen_ids:
+            safe_print(f"[CLEANUP] Removing duplicate atom_id: {aid} (chunk_id={c.get('chunk_id')})")
+            continue
+        if aid:
+            seen_ids.add(aid)
+        cleaned.append(c)
+    return cleaned
+
+# ------------------------------
+# QA-valideringer
+# ------------------------------
+
+def validate_atom_id_uniqueness(chunks: List[Dict[str, Any]]) -> None:
+    counts = {}
+    dups = {}
+    for c in chunks:
+        aid = c.get('atom_id')
+        if not aid:
+            continue
+        counts[aid] = counts.get(aid, 0) + 1
+    for aid, cnt in counts.items():
+        if cnt > 1:
+            dups[aid] = cnt
+    if dups:
+        safe_print("[FEJL] Dublerede atom_id'er fundet:")
+        for aid, cnt in dups.items():
+            safe_print(f"  {aid} ({cnt}x)")
+        raise ValueError(f"Atom_ID unikhedskrav overtrådt! {len(dups)} dublerede ID'er.")
+
+
+def validate_chunk_consistency(chunks: List[Dict[str, Any]]) -> None:
+    errors = []
+    warnings = []
+    for c in chunks:
+        atom_id = c.get('atom_id') or ''
+        atom_base_id = c.get('atom_base_id') or ''
+        kind = c.get('kind')
+        level = c.get('level')
+        # ASCII-sikker atom_id
+        if '§' in atom_id:
+            errors.append(f"Non-ASCII '§' i atom_id: {atom_id}")
+        # parent embeddable=false
+        if kind == 'parent' and c.get('embeddable') is not False:
+            errors.append(f"Parent skal have embeddable=false: {c.get('chunk_id')}")
+        # implicit stk1 når nr findes uden stk
+        if c.get('paragraf') and c.get('nr') and not c.get('stk'):
+            if 'stk1' not in atom_id:
+                errors.append(f"Manglende implicit stk1 i atom_id: {atom_id}")
+        # part-suffix konsistens
+        pi, pt = c.get('part_index'), c.get('part_total')
+        if pi and pt:
+            expected = f"part{pi}-of-{pt}"
+            if expected not in atom_id:
+                # kun advarsel i bu3-varianten (split deaktiveret normalt)
+                warnings.append(f"Part-suffix mangler i atom_id: {atom_id}")
+            if 'part' in atom_base_id:
+                errors.append(f"atom_base_id må ikke indeholde part: {atom_base_id}")
+        # note-id konsistens
+        if level == 'note' and c.get('note_id') is not None:
+            if f"note{c.get('note_id')}" not in atom_id:
+                errors.append(f"Note-ID mismatch i atom_id: {atom_id}")
+    if errors:
+        safe_print("[FEJL] Konsistensfejl:")
+        for e in errors:
+            safe_print(f"  - {e}")
+        raise ValueError(f"Chunk konsistens-fejl: {len(errors)} problemer")
+    if warnings:
+        safe_print("[ADVARSEL] Konsistens-advarsler:")
+        for w in warnings:
+            safe_print(f"  - {w}")
 
 
 def clean_note_chunk_fields(chunks: List[Dict[str, Any]]) -> None:
@@ -1394,6 +1719,7 @@ def main():
     ap.add_argument('--use-llm-parents', action='store_true', help='Brug LLM til at generere parent chunk bullets')
     ap.add_argument('--fireworks-api-key', help='Fireworks API key (alternativ til miljøvariabel)')
     ap.add_argument('--no-csv', action='store_true', help='Undlad at generere en CSV-fil')
+    ap.add_argument('--law-id', default=None, help='Angiv law_id (overstyrer auto-afledning fra filnavn)')
     ap.add_argument('--max-tokens', type=int, default=None, help='Maksimalt antal tokens per chunk (aktiverer auto-split)')
     args = ap.parse_args()
 
@@ -1402,7 +1728,7 @@ def main():
     out_prefix = args.out_prefix or os.path.splitext(os.path.basename(in_path))[0].replace(' ', '_')
 
     # law_id: CLI override eller auto-afledning
-    law_id = auto_derive_law_id(os.path.splitext(os.path.basename(in_path))[0])
+    law_id = args.law_id or auto_derive_law_id(os.path.splitext(os.path.basename(in_path))[0])
     
     # Initialize LLM if requested
     llm = None
@@ -1432,9 +1758,15 @@ def main():
 
     # Apply note context
     apply_note_context(chunks)
-    
-    # Simple QA check
-    safe_print(f"Generated {len(chunks)} chunks with UUID cross-references")
+    # Update note IDs with coordinate context
+    update_note_atom_ids_with_context(chunks, law_id)
+
+    # Simple QA check and totals
+    num_parents = sum(1 for c in chunks if c.get('kind') == 'parent')
+    num_notes = sum(1 for c in chunks if c.get('kind') == 'note')
+    num_rules = sum(1 for c in chunks if c.get('kind') == 'rule')
+    num_crossrefs = sum(len(c.get('crossrefs', []) or []) for c in chunks)
+    safe_print(f"Generated {len(chunks)} chunks (rules={num_rules}, parents={num_parents}, notes={num_notes}, crossrefs={num_crossrefs})")
 
     # Indekser til parent‑bygning
     by_p, by_ps, by_psn, p_intro, sec_to_p = index_by_hierarchy(chunks)
@@ -1445,7 +1777,7 @@ def main():
         # tjek om der findes nr‑børn for denne (p,s)
         nr_children = [c for c in chunks if c.get('paragraf') == p and c.get('stk') == s and c.get('level') == 'nr']
         if nr_children:
-            parent = make_stk_parent(chunks, p, s, p_intro.get(p), use_llm=args.use_llm_parents, llm=llm)
+            parent = make_stk_parent(chunks, p, s, p_intro.get(p), law_id, use_llm=args.use_llm_parents, llm=llm)
             if parent:
                 stk_parents.append(parent)
 
@@ -1456,7 +1788,7 @@ def main():
     for p, arr in by_p.items():
         has_stk = any(c.get('paragraf') == p and c.get('level') in ('stk', 'stk_parent') and c.get('nr') is None for c in chunks)
         if has_stk:
-            parent = make_paragraf_parent(chunks, p, p_intro.get(p))
+            parent = make_paragraf_parent(chunks, p, p_intro.get(p), law_id)
             if parent:
                 paragraf_parents.append(parent)
 
@@ -1465,7 +1797,7 @@ def main():
     # 3) section_parent (kapitel/afsnit)
     section_parents: List[Dict[str, Any]] = []
     for sec_label, paragrafs in sec_to_p.items():
-        parent = make_section_parent(sec_label, chunks, paragrafs, p_intro)
+        parent = make_section_parent(sec_label, chunks, paragrafs, p_intro, law_id)
         if parent:
             section_parents.append(parent)
 
@@ -1495,6 +1827,9 @@ def main():
     # Skriv filer
     jsonl_path = f"{out_prefix}_chunks.jsonl"
     json_path = f"{out_prefix}_chunks.json"
+    # Cleanup før QA/output
+    chunks = cleanup_before_qa(chunks)
+
     write_jsonl(jsonl_path, chunks)
     write_json(json_path, chunks)
 
@@ -1504,6 +1839,10 @@ def main():
         safe_print(f"Wrote {len(chunks)} chunks -> {jsonl_path} + {json_path} (CSV output er deaktiveret)")
     else:
         safe_print(f"Wrote {len(chunks)} chunks -> {jsonl_path} + {json_path}")
+
+    # QA-valideringer til sidst
+    validate_atom_id_uniqueness(chunks)
+    validate_chunk_consistency(chunks)
 
 
 if __name__ == '__main__':
