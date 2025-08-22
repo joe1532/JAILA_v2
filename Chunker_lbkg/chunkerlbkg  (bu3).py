@@ -61,7 +61,7 @@ RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')  # inline notehenvisnin
 _LAW_CODES = r'(?:KSL|SEL|EBL|AL|LL|ML|SFL|PSL|SSL)'
 RE_CROSSREF_BASIC = re.compile(
     r'(?:jf\.\s*|se\s*også\s*|jfr\.\s*|efter\s*|i\s*henhold\s*til\s*)?'  # valgfrit præfiks
-    rf'(?:\b{_LAW_CODES}\s*)?'  # valgfrit lov-præfiks (kun kendte koder)
+    rf'(?:\b({_LAW_CODES})\s*)?'  # valgfrit lov-præfiks (kun kendte koder)
     r'§\s*(\d+\s*[A-Za-z]?)'  # paragraf (tillad mellemrum før bogstav)
     r'(?:\s*,\s*stk\.\s*(\d+[A-Za-z]?))?'  # stykke
     r'(?:\s*,\s*nr\.\s*(\d+[A-Za-z]?))?'  # nummer
@@ -69,11 +69,11 @@ RE_CROSSREF_BASIC = re.compile(
     re.IGNORECASE
 )
 RE_CROSSREF_RANGE = re.compile(
-    rf'(?:\b{_LAW_CODES}\s*)?§\s*(\d+\s*[A-Za-z]?)\s*,\s*(stk\.|nr\.)\s*(\d+[A-Za-z]?)\s*[–-]\s*(\d+[A-Za-z]?)',
+    rf'(?:\b({_LAW_CODES})\s*)?§\s*(\d+\s*[A-Za-z]?)\s*,\s*(stk\.|nr\.)\s*(\d+[A-Za-z]?)\s*[–-]\s*(\d+[A-Za-z]?)',
     re.IGNORECASE
 )
 RE_CROSSREF_LIST = re.compile(
-    rf'(?:\b{_LAW_CODES}\s*)?§\s*(\d+\s*[A-Za-z]?)\s*,\s*(stk\.|nr\.)\s*'
+    rf'(?:\b({_LAW_CODES})\s*)?§\s*(\d+\s*[A-Za-z]?)\s*,\s*(stk\.|nr\.)\s*'
     r'(?!litra\b)(?!pkt\b)'
     r'((?:\d+[A-Za-z]?(?:\s*[–-]\s*\d+[A-Za-z]?)?)(?:\s*,\s*\d+[A-Za-z]?(?:\s*[–-]\s*\d+[A-Za-z]?)?)*(?:\s*og\s*\d+[A-Za-z]?(?:\s*[–-]\s*\d+[A-Za-z]?)?)?)',
     re.IGNORECASE
@@ -129,13 +129,47 @@ def expand_range(start: str, end: str) -> list:
     return [str(i) for i in range(a, b+1)]
 
 
+def get_law_code_from_law_id(law_id: str) -> str:
+    # KSL_2025-04-11_nr460 -> KSL
+    return (law_id.split('_', 1)[0] if '_' in law_id else law_id).upper()
+
+
+_LAW_NAME_TO_CODE = {
+    # fulde navne (enkle varianter)
+    'kildeskatteloven': 'KSL', 'kildeskattelovens': 'KSL',
+    'ligningsloven': 'LL', 'ligningslovens': 'LL',
+    'selskabsskatteloven': 'SSL', 'selskabsskattelovens': 'SSL',
+    'momsloven': 'ML', 'momslovens': 'ML', 'merværdiafgiftsloven': 'ML',
+    'skatteforvaltningsloven': 'SFL', 'skatteforvaltningslovens': 'SFL',
+    'personskatteloven': 'PSL', 'personskattelovens': 'PSL',
+    'afskrivningsloven': 'AL', 'afskrivningslovens': 'AL',
+    'ejendomsavancebeskatningsloven': 'EBL', 'ejendomsavancebeskatningslovens': 'EBL',
+    'pensionsbeskatningsloven': 'PBL', 'pensionsbeskatningslovens': 'PBL',
+}
+
+
+def resolve_target_law(law_prefix: Optional[str], context_before: str, current_law_id: str) -> str:
+    # 1) eksplicit kode trumfer
+    if law_prefix:
+        code = law_prefix.upper()
+        # brug current_law_id hvis koden matcher aktuel lov
+        return current_law_id if get_law_code_from_law_id(current_law_id) == code else code
+    # 2) forsøg at finde fuldt navn lige før match
+    ctx = context_before.strip().lower()
+    for name, code in _LAW_NAME_TO_CODE.items():
+        if ctx.endswith(name):
+            return current_law_id if get_law_code_from_law_id(current_law_id) == code else code
+    # 3) fallback til aktuel lov
+    return current_law_id
+
+
 def extract_crossrefs(text: str, current_law_id: str, current_paragraf: Optional[str] = None) -> list:
     crossrefs = []
     last_abs = None  # (par, stk, nr, lit)
     # basic
     for m in RE_CROSSREF_BASIC.finditer(text):
-        par, stk, nr, lit = m.groups()
-        target_law = current_law_id
+        law_prefix, par, stk, nr, lit = m.groups()
+        target_law = resolve_target_law(law_prefix, text[max(0, m.start()-40):m.start()], current_law_id)
         last_abs = (par, stk, nr, lit)
         crossrefs.append({
             "raw": m.group(0),
@@ -151,8 +185,8 @@ def extract_crossrefs(text: str, current_law_id: str, current_paragraf: Optional
         })
     # ranges
     for m in RE_CROSSREF_RANGE.finditer(text):
-        par, typ, a, b = m.groups()
-        target_law = current_law_id
+        law_prefix, par, typ, a, b = m.groups()
+        target_law = resolve_target_law(law_prefix, text[max(0, m.start()-40):m.start()], current_law_id)
         for val in expand_range(a, b):
             if typ.lower() == 'stk.':
                 cr_id = make_crossref_id(target_law, par, val)
@@ -172,8 +206,8 @@ def extract_crossrefs(text: str, current_law_id: str, current_paragraf: Optional
             })
     # lists
     for m in RE_CROSSREF_LIST.finditer(text):
-        par, typ, lst = m.groups()
-        target_law = current_law_id
+        law_prefix, par, typ, lst = m.groups()
+        target_law = resolve_target_law(law_prefix, text[max(0, m.start()-40):m.start()], current_law_id)
         items = parse_coordinate_list(lst)
         expanded = []
         for it in items:
@@ -404,6 +438,14 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
         # Opdater chunk_id med part-info
         original_id = part_chunk.get("chunk_id", "")
         part_chunk["chunk_id"] = f"{original_id} (part {i+1})"
+        # Opdater atom_id med part-suffix (base-id uændret)
+        original_atom_id = part_chunk.get("atom_id", "")
+        if original_atom_id:
+            if "--kind" in original_atom_id:
+                base_id, kind_part = original_atom_id.rsplit("--kind", 1)
+                part_chunk["atom_id"] = f"{base_id}--part{i+1}-of-{len(text_parts)}--kind{kind_part}"
+            else:
+                part_chunk["atom_id"] = f"{original_atom_id}--part{i+1}-of-{len(text_parts)}"
         
         # Filtrer metadata baseret på position
         def filter_metadata_by_position(metadata_list: List[Dict], start: int, end: int) -> List[Dict]:
@@ -417,15 +459,20 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
                     filtered.append(new_item)
             return filtered
         
-        # Fordel metadata (note_anchors skal genberegnes for split-dele)
-        # For nu sættes de til tom - kan implementeres senere når split aktiveres
-        part_chunk["note_anchors"] = []
+        # Fordel metadata, inkl. note_anchors
+        part_chunk["note_anchors"] = filter_metadata_by_position(
+            original_chunk.get("note_anchors", []), part_start, part_end
+        )
         part_chunk["dom_refs"] = filter_metadata_by_position(
             original_chunk.get("dom_refs", []), part_start, part_end
         )
         part_chunk["jv_refs"] = filter_metadata_by_position(
             original_chunk.get("jv_refs", []), part_start, part_end
         )
+        part_chunk["crossrefs"] = filter_metadata_by_position(
+            original_chunk.get("crossrefs", []), part_start, part_end
+        )
+        part_chunk["crossref_ids"] = [cr.get("crossref_id") for cr in part_chunk.get("crossrefs", [])]
         
         parts.append(part_chunk)
         current_pos = part_end
@@ -444,32 +491,19 @@ def split_chunk_by_tokens(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[s
     if not should_split_chunk(text, max_tokens):
         return [chunk]
     
-    # PLACEHOLDER: Deaktiveret indtil videre
-    safe_print(f"Split-funktionalitet er forberedt men ikke aktiveret. Chunk {chunk.get('chunk_id')} har {estimate_tokens(text)} tokens.")
-    return [chunk]
-    
-    # FRAMEWORK KLAR TIL AKTIVERING:
-    # split_points = find_split_points(text, max_tokens)
-    # 
-    # if not split_points:
-    #     return [chunk]
-    # 
-    # # Split teksten
-    # text_parts = []
-    # last_pos = 0
-    # 
-    # for split_pos in split_points:
-    #     text_parts.append(text[last_pos:split_pos].strip())
-    #     last_pos = split_pos
-    # 
-    # # Tilføj sidste del
-    # text_parts.append(text[last_pos:].strip())
-    # 
-    # # Fjern tomme dele
-    # text_parts = [part for part in text_parts if part.strip()]
-    # 
-    # # Generer split-chunks med korrekt metadata-fordeling
-    # return redistribute_metadata(chunk, text_parts)
+    split_points = find_split_points(text, max_tokens)
+    if not split_points:
+        return [chunk]
+    text_parts = []
+    last_pos = 0
+    for split_pos in split_points:
+        text_parts.append(text[last_pos:split_pos].strip())
+        last_pos = split_pos
+    text_parts.append(text[last_pos:].strip())
+    text_parts = [part for part in text_parts if part.strip()]
+    if len(text_parts) <= 1:
+        return [chunk]
+    return redistribute_metadata(chunk, text_parts)
 
 # ------------------------------
 # LLM Integration
@@ -927,6 +961,20 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             kind=kind
         )
 
+        # Syntetiske søgetermer
+        coord_aliases = []
+        if ctx["paragraf"]:
+            par_norm = normalize_coordinate(ctx["paragraf"]) or ""
+            coord_aliases.append(f"par{par_norm}")
+            if eff_stk:
+                coord_aliases.append(f"stk{normalize_coordinate(eff_stk)}")
+            if ctx["nr"]:
+                coord_aliases.append(f"nr{normalize_coordinate(ctx['nr'])}")
+            if ctx.get("litra"):
+                coord_aliases.append(f"lit{normalize_coordinate(ctx.get('litra'))}")
+            if ctx.get("pkt"):
+                coord_aliases.append(f"pkt{normalize_coordinate(ctx.get('pkt'))}")
+
         chunks.append({
             "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
             "chunk_id": make_chunk_id(ctx["paragraf"], eff_stk, ctx["nr"], section=None),
@@ -944,11 +992,13 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             "litra": ctx.get("litra"),
             "pkt": ctx.get("pkt"),
             "text_plain": text_plain,
+            "search_terms": "|".join([a for a in coord_aliases if a]),
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
             "jv_refs": jv_refs,
             "crossrefs": crossrefs,
             "crossref_ids": crossref_ids,
+            "rel": {},
             "note_refs": note_ids,  # Bevar for kompatibilitet
             "note_uuids": [],  # Vil blive udfyldt senere
             # Split-ready struktur (klar til aktivering)
@@ -1001,11 +1051,13 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
                 "section_label": current_section_label,
                 "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
                 "text_plain": text_plain,
+                "search_terms": "",
                 "note_anchors": note_anchors,
                 "dom_refs": dom_refs,
                 "jv_refs": jv_refs,
                 "crossrefs": crossrefs,
                 "crossref_ids": crossref_ids,
+                "rel": {},
                 "note_refs": note_ids,
                 "note_uuids": [],
                 # Split-ready struktur (klar til aktivering)
@@ -1113,11 +1165,13 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             "section_label": None,
             "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
             "text_plain": text_plain,
+            "search_terms": "",
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
             "jv_refs": jv_refs,
             "crossrefs": crossrefs,
             "crossref_ids": crossref_ids,
+            "rel": {},
             "referenced_by": [],  # Vil blive udfyldt senere
             # Split-ready struktur (klar til aktivering)
             "note_id": int(nid),  # Stabil note-id som int
