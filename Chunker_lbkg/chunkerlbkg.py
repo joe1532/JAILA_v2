@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -10,7 +9,7 @@ Kørsel:
 
 Output:
   ksl_chunks.jsonl
-  ksl_chunks.csv
+  ksl_chunks.json
 
 Afhænger kun af standardbiblioteket. Hvis pandas er installeret, bruges det til CSV; ellers falder scriptet tilbage til csv‑modulet.
 """
@@ -18,6 +17,7 @@ Afhænger kun af standardbiblioteket. Hvis pandas er installeret, bruges det til
 from __future__ import annotations
 import re, os, json, argparse, csv, uuid
 from typing import List, Dict, Any, Optional, Tuple
+import sys
 
 # LLM imports (optional)
 try:
@@ -29,47 +29,36 @@ except ImportError:
 # ------------------------------
 # Regex‑konfiguration (kan tilpasses)
 # ------------------------------
-# FIX: Specifik til juridiske dokumenter - undgå falske "# Indledning" osv.
 RE_SECTION      = re.compile(r'^#\s*(AFSNIT|KAPITEL|DEL|BILAG)\s+(.+)$', re.IGNORECASE)
-# FIX: Understøt § med bogstav og mellemrum (§ 33 A)
 RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', re.IGNORECASE)
-# FIX: Case-insensitive Stk. matching
 RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.', re.IGNORECASE)
-# FIX: Understøt nr. med bogstav-suffiks (nr. 10 a)
 RE_NR           = re.compile(r'^###\s*(\d+(?:\s*[a-zA-Z]+)?)[\)\.]', re.IGNORECASE)
-RE_NOTE_BODY    = re.compile(r'^\s*\(\u200B?(\d+)\u200B?\)\s')   # note‑krop (tolerant for indryk + zero-width spaces)
+RE_LITRA        = re.compile(r'^####\s*([a-z])[\)\.]', re.IGNORECASE)
+RE_PUNKT        = re.compile(r'^#####\s*(\d+)[\)\.]', re.IGNORECASE)
+RE_NOTE_BODY    = re.compile(r'^\s*\(\u200B?(\d+)\u200B?\)\s')
 RE_MD_PREFIX    = re.compile(r'^(#+)\s*')
-
-RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')  # inline notehenvisninger (med zero-width spaces)
+RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')
 
 ANCHOR_FMT = "⟦{id}⟧"
 
 def generate_chunk_uuid() -> str:
     """Generate full random UUID for chunks to avoid collisions."""
-    return str(uuid.uuid4())  # Fuld UUID: "123e4567-e89b-12d3-a456-426614174000"
+    return str(uuid.uuid4())
 
 
 def estimate_tokens(text: str) -> int:
     """Forbedret token-estimering med ordtælling som fallback for kortordet tekst."""
     if not text:
         return 0
-    
-    # Primær heuristik: 4 karakterer ≈ 1 token for dansk tekst
     char_based = len(text) // 4
-    
-    # Fallback for meget kortordet tekst: ordtælling * 1.3
-    # (dansk har flere sammensatte ord end engelsk, så lidt højere faktor)
     word_count = len(text.split())
     word_based = int(word_count * 1.3)
-    
-    # Brug det højeste estimat for at undgå at undervurdere
-    # Dette er konservativt og sikrer at vi ikke overskrider token-grænser
     return max(char_based, word_based)
 
 
 def should_split_chunk(text: str, max_tokens: Optional[int]) -> bool:
     """Afgør om en chunk skal splittes baseret på token-begrænsning."""
-    if max_tokens is None:
+    if max_tokens is None or max_tokens <= 0:
         return False
     return estimate_tokens(text) > max_tokens
 
@@ -79,10 +68,8 @@ def find_split_points(text: str, max_tokens: int) -> List[int]:
     if estimate_tokens(text) <= max_tokens:
         return []
     
-    # Split-strategi: Prioriter naturlige pauser
     split_points = []
     
-    # 1. Prøv at splitte på afsnit (dobbelt newline)
     paragraphs = text.split('\n\n')
     current_pos = 0
     current_tokens = 0
@@ -96,9 +83,8 @@ def find_split_points(text: str, max_tokens: int) -> List[int]:
         else:
             current_tokens += para_tokens
         
-        current_pos += len(para) + (2 if i < len(paragraphs) - 1 else 0)  # +2 for \n\n
+        current_pos += len(para) + (2 if i < len(paragraphs) - 1 else 0)
     
-    # 2. Hvis afsnit er for store, split på sætninger
     if not split_points and estimate_tokens(text) > max_tokens:
         sentences = text.split('. ')
         current_pos = 0
@@ -113,7 +99,7 @@ def find_split_points(text: str, max_tokens: int) -> List[int]:
             else:
                 current_tokens += sent_tokens
             
-            current_pos += len(sent) + (2 if i < len(sentences) - 1 else 0)  # +2 for '. '
+            current_pos += len(sent) + (2 if i < len(sentences) - 1 else 0)
     
     return split_points
 
@@ -127,7 +113,6 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
         part_start = current_pos
         part_end = current_pos + len(text_part)
         
-        # Kopier basis chunk-struktur
         part_chunk = original_chunk.copy()
         part_chunk["uuid"] = generate_chunk_uuid()
         part_chunk["text_plain"] = text_part
@@ -135,29 +120,27 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
         part_chunk["part_total"] = len(text_parts)
         part_chunk["split_reason"] = "token_limit"
         
-        # Opdater chunk_id med part-info
         original_id = part_chunk.get("chunk_id", "")
         part_chunk["chunk_id"] = f"{original_id} (part {i+1})"
         
-        # Opdater atom_id med part-info
         original_atom_id = part_chunk.get("atom_id", "")
         if original_atom_id:
-            # Tilføj part-info til slutningen af atom_id
-            part_chunk["atom_id"] = f"{original_atom_id}--part{i+1}-of-{len(text_parts)}"
+            if "--kind" in original_atom_id:
+                base_id, kind_part = original_atom_id.rsplit("--kind", 1)
+                part_chunk["atom_id"] = f"{base_id}--part{i+1}-of-{len(text_parts)}--kind{kind_part}"
+            else:
+                part_chunk["atom_id"] = f"{original_atom_id}--part{i+1}-of-{len(text_parts)}"
         
-        # Filtrer metadata baseret på position
         def filter_metadata_by_position(metadata_list: List[Dict], start: int, end: int) -> List[Dict]:
             filtered = []
             for item in metadata_list:
                 item_start = item.get("start", 0)
                 if start <= item_start < end:
-                    # Juster position relativt til denne del
                     new_item = item.copy()
                     new_item["start"] = item_start - start
                     filtered.append(new_item)
             return filtered
         
-        # Fordel metadata med korrekt positions-filtrering
         part_chunk["note_anchors"] = filter_metadata_by_position(
             original_chunk.get("note_anchors", []), part_start, part_end
         )
@@ -175,25 +158,20 @@ def redistribute_metadata(original_chunk: Dict[str, Any], text_parts: List[str])
 
 
 def split_chunk_by_tokens(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[str, Any]]:
-    """Split en chunk i mindre dele baseret på token-begrænsning.
-    
-    FRAMEWORK: Klar til aktivering når token-begrænsning sættes.
-    """
+    """Split en chunk i mindre dele baseret på token-begrænsning."""
     text = chunk.get("text_plain", "")
     
-    # Tjek om split er nødvendigt
     if not should_split_chunk(text, max_tokens):
         return [chunk]
     
-    # AKTIVERET: Split-funktionalitet med hård token-grænse
     split_points = find_split_points(text, max_tokens)
     
     if not split_points:
         return [chunk]
     
     print(f"🔄 Splitting chunk {chunk.get('chunk_id')} ({estimate_tokens(text)} tokens) into parts...")
+    sys.stdout.flush()
     
-    # Split teksten
     text_parts = []
     last_pos = 0
     
@@ -201,35 +179,27 @@ def split_chunk_by_tokens(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[s
         text_parts.append(text[last_pos:split_pos].strip())
         last_pos = split_pos
     
-    # Tilføj sidste del
     text_parts.append(text[last_pos:].strip())
     
-    # Fjern tomme dele
     text_parts = [part for part in text_parts if part.strip()]
     
     if len(text_parts) <= 1:
-        return [chunk]  # Ingen effektiv split
+        return [chunk]
     
-    # Generer split-chunks med korrekt metadata-fordeling
     split_chunks = redistribute_metadata(chunk, text_parts)
     print(f"✅ Split into {len(split_chunks)} parts")
+    sys.stdout.flush()
     return split_chunks
 
-# ------------------------------
-# LLM Integration
-# ------------------------------
 
 def get_fireworks_llm(api_key=None):
     """Initialize Fireworks LLM if available."""
     if not FIREWORKS_AVAILABLE:
         return None
     try:
-        # Set API key if provided
         if api_key:
-            # Debug: Setting API key (removed for production)
             import fireworks
             fireworks.client.api_key = api_key
-            # Also try setting as environment variable
             import os
             os.environ['FIREWORKS_API_KEY'] = api_key
         
@@ -248,12 +218,7 @@ def generate_llm_bullets(children_chunks: List[Dict[str, Any]],
     if llm is None:
         return None
     
-    # Format children for LLM prompt
-    child_texts = []
-    for i, child in enumerate(children_chunks, 1):
-        text = child.get('text_plain', '')[:200]  # Limit text length
-        child_texts.append(f"{i}. {text}")
-    
+    child_texts = [f"{i}. {child.get('text_plain', '')[:200]}" for i, child in enumerate(children_chunks, 1)]
     children_text = "\n".join(child_texts)
     
     prompt = f"""Du er en ekspert i dansk skatteret. Lav en præcis oversigt af følgende juridiske underpunkter:
@@ -277,370 +242,231 @@ Skattepligt omfatter følgende personer:
 
     try:
         response = llm.completions.create(prompt=prompt)
-        result = response.choices[0].text.strip()
-        # DEBUG: print(f"🤖 LLM Response ({len(result)} chars): {result[:100]}...")
-        return result
+        return response.choices[0].text.strip()
     except Exception as e:
         print(f"Warning: LLM call failed: {e}")
         return None
-
-# ------------------------------
-# Hjælpere
-# ------------------------------
 
 def strip_md(line: str) -> str:
     """Fjern kun markdown # fra almindelige linjer."""
     return RE_MD_PREFIX.sub('', line).strip()
 
-
 def strip_structural_markers(line: str, line_type: str = "body") -> str:
     """Strip kun strukturmarkeringer fra overskriftslinjer, bevar brødtekst ren."""
     if line_type == "stk":
-        # Fjern: ### Stk. 2. → bevar resten
         return re.sub(r'^###\s*stk\.\s*[0-9A-Za-z]+\.\s*', '', line, flags=re.IGNORECASE).strip()
     elif line_type == "nr":
-        # Fjern: ### 10 a) → bevar resten
         return re.sub(r'^###\s*\d+(?:\s*[a-zA-Z]+)?[\)\.]?\s*', '', line).strip()
+    elif line_type == "litra":
+        return re.sub(r'^####\s*[a-z][\)\.]?\s*', '', line, flags=re.IGNORECASE).strip()
+    elif line_type == "punkt":
+        return re.sub(r'^#####\s*\d+[\)\.]?\s*', '', line).strip()
     else:
-        # Brødtekst: fjern kun markdown #
         return strip_md(line)
 
-
-
-
-
 def first_sentence(text: str, max_words: int = 28, fallback_words: int = 24) -> str:
-    """Enkel heuristik til kort essens: tag første sætning eller truncér på ordgrænse."""
     t = text.strip()
-    # find første punktum
     dot = t.find('.')
-    if 0 < dot < len(t)-1:
-        candidate = t[:dot+1]
-    else:
-        candidate = t
-    # ord‑begrænsning
+    candidate = t[:dot+1] if 0 < dot < len(t)-1 else t
     words = candidate.split()
     if len(words) > max_words:
         candidate = ' '.join(words[:fallback_words]).rstrip(',;') + ' …'
     return candidate.strip()
 
-
 def summarize_bullet(text: str, max_words: int = 50) -> str:
     t = first_sentence(text, max_words=max_words, fallback_words=max_words-5)
-    # Hvis første sætning er for kort, tag mere kontekst
-    if len(t.split()) < 8:  # Hvis under 8 ord, tag mere
+    if len(t.split()) < 8:
         return text[:180] + (' …' if len(text) > 180 else '')
-    # fald tilbage hvis tom
     return t or text[:150] + (' …' if len(text) > 150 else '')
 
-
 def summarize_bullet_no_ellipses(text: str, max_words: int = 25) -> str:
-    """Summarize bullet for parent chunks WITHOUT ellipses - keep complete sentences.
-    Enforces word limit for consistency with LLM output (20-25 words)."""
     t = text.strip()
-    
-    # Find første komplet sætning
     dot = t.find('.')
     if 0 < dot < len(t)-1:
         first_sent = t[:dot+1].strip()
         words = first_sent.split()
-        
-        # Tjek ordgrænse på første sætning
-        if len(words) >= 5 and len(words) <= max_words:
+        if 5 <= len(words) <= max_words:
             return first_sent
         elif len(words) > max_words:
-            # Trim til max_words på ordgrænse
             return ' '.join(words[:max_words])
     
-    # Hvis ingen god første sætning, trim hele teksten til ordgrænse
     words = t.split()
     if len(words) <= max_words:
         return t
     
-    # Trim til max_words og prøv at ende på punktum hvis muligt
     trimmed = ' '.join(words[:max_words])
-    if trimmed.endswith('.'):
-        return trimmed
-    
-    # Find sidste punktum inden for trimmed tekst
+    if trimmed.endswith('.'): return trimmed
     last_dot = trimmed.rfind('.')
-    if last_dot > len(trimmed) * 0.7:  # Hvis punktum er mindst 70% inde
+    if last_dot > len(trimmed) * 0.7:
         return trimmed[:last_dot+1]
     
-    # Fallback: brug trimmed tekst uden punktum
     return trimmed
 
-
 def intro_no_ellipses(text: str) -> str:
-    """Generate intro for parent chunks WITHOUT ellipses - keep complete sentences."""
-    if not text:
-        return ""
-    
+    if not text: return ""
     t = text.strip()
-    # Find første komplet sætning
     dot = t.find('.')
     if 0 < dot < len(t)-1:
-        # Tag første sætning hvis den er rimelig lang
         first_sent = t[:dot+1].strip()
-        if len(first_sent.split()) >= 3:  # Mindst 3 ord
+        if len(first_sent.split()) >= 3:
             return first_sent
-    
-    # Hvis ingen god første sætning, tag op til 150 karakterer uden at afbryde ord
-    if len(t) <= 150:
-        return t
-    
-    # Find sidste mellemrum inden for 150 karakterer
+    if len(t) <= 150: return t
     truncated = t[:150]
     last_space = truncated.rfind(' ')
-    if last_space > 50:  # Hvis der er et mellemrum efter 50 karakterer
-        return truncated[:last_space]
-    
-    # Fallback: tag hele teksten
-    return t
-
+    return truncated[:last_space] if last_space > 50 else t
 
 def clean_ellipses_from_text(text: str) -> str:
-    """Remove all ellipses and truncation artifacts from parent text."""
-    if not text:
-        return text
-    
-    # Fjern forskellige ellipse-varianter
-    cleaned = text
-    cleaned = cleaned.replace(' …', '')
-    cleaned = cleaned.replace('…', '')
-    cleaned = cleaned.replace(' ...', '')
-    cleaned = cleaned.replace('...', '')
-    
-    # Fjern trailing kommaer og semikolon der kan være tilbage efter ellipse-fjernelse
-    cleaned = cleaned.rstrip(' ,;')
-    
-    return cleaned.strip()
-
+    if not text: return text
+    cleaned = text.replace(' …', '').replace('…', '').replace(' ...', '').replace('...', '')
+    return cleaned.rstrip(' ,;').strip()
 
 def extract_dom_references(text: str) -> List[Dict[str, Any]]:
     """Udtræk domreferencer fra tekst og returnér som metadata."""
-    # Udvidede mønstre til at fange flere formater
     patterns = [
-        r'\bSKM\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?\d+)? ?[A-ZÆØÅ]+\b',  # SKM 2023 7 HR, SKM.2023.7.HR, SKM 2003 405 HR
-        r'\bTfS\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?(?:[ \.]?[A-ZÆØÅ]+)?',  # TfS 1998 354 H, TfS.1998.354.H, TfS 1995 137 LSR
-        r'\bU\.? ?(?:\d{4}[\.-])? ?\d+(?:[\.\/]\d+)?(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?',  # U 2004.234, U.2004/234H
-        r'\bLSR\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?(?:[ \.]?[A-ZÆØÅ]+)?',  # LSR 2022 42, LSR.2022.42.SR
-        r'\b(?:Vestre|Østre|Højesterets)\.? ?[Ll]andsrets? ?[Dd]om af \d{1,2}\.? ?[a-zæøå]+ \d{4}\b',  # Vestre Landsrets Dom af 12. juni 2018
-        r'\b(?:Højesterets|HR)\.? ?[Dd]om af \d{1,2}\.? ?[a-zæøå]+ \d{4}\b'  # Højesterets Dom af 4. marts 2022
+        r'\bSKM\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?\d+)? ?[A-ZÆØÅ]+\b',
+        r'\bTfS\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?(?:[ \.]?[A-ZÆØÅ]+)?',
+        r'\bU\.? ?(?:\d{4}[\.-])? ?\d+(?:[\.\/]\d+)?(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?',
+        r'\bLSR\.? ?(?:\d{4}[\.-])? ?\d+(?:[ \.]?[A-ZÆØÅ]+)?(?:[ \.]?\d+)?(?:[ \.]?[A-ZÆØÅ]+)?',
+        r'\b(?:Vestre|Østre|Højesterets)\.? ?[Ll]andsrets? ?[Dd]om af \d{1,2}\.? ?[a-zæøå]+ \d{4}\b',
+        r'\b(?:Højesterets|HR)\.? ?[Dd]om af \d{1,2}\.? ?[a-zæøå]+ \d{4}\b'
     ]
     combined_pattern = re.compile('|'.join(patterns), re.IGNORECASE)
-    
     dom_refs = []
     for match in combined_pattern.finditer(text):
         raw = match.group(0)
         norm_id = re.sub(r'\s+', '', raw).replace("/", ".").replace(" ", "").lower()
-        dom_refs.append({
-            "raw": raw,
-            "start": match.start(),
-            "len": len(raw),
-            "norm_id": norm_id
-        })
-    
+        dom_refs.append({"raw": raw, "start": match.start(), "len": len(raw), "norm_id": norm_id})
     return dom_refs
-
 
 def extract_jv_references(text: str) -> List[Dict[str, Any]]:
     """Udtræk JV-referencer fra tekst og returnér som metadata."""
-    # Mønstre til at fange JV-referencer - inkluderer både årstal-versioner og afsnit-formater
     patterns = [
-        # Den juridiske vejledning 2025-1 - A.A Processuelle regler for Skatteforvaltningens opgaver
         r'\bDen juridiske vejledning \d{4}-\d+ - [A-Z]\.[A-Z](?:\.[A-Z])* [^\n\r]+',
-        
-        # Vejledning om Den juridiske vejledning 2025-1
         r'\bVejledning om Den juridiske vejledning \d{4}-\d+',
-        
-        # Kortere former som "JV 2025-1 A.A"
         r'\bJV\.? ?\d{4}-\d+ [A-Z]\.[A-Z](?:\.[A-Z])*(?:\s+[^\n\r,\.;]+)?',
-        
-        # "Den juridiske vejledning" efterfulgt af år og sektion
         r'\bDen juridiske vejledning,? ?\d{4}-\d+,? ?[A-Z]\.[A-Z](?:\.[A-Z])*(?:\s+[^\n\r,\.;]+)?',
-        
-        # Generisk "JV" reference med årstal
         r'\bJV\.? ?\d{4}-\d+(?:\s+[A-Z]\.[A-Z](?:\.[A-Z])*)?(?:\s+[^\n\r,\.;]+)?',
-        
-        # Afsnit-format fra inputfilen: "JV afsnit C.F.1.2.3"
         r'\bJV\s+afsnit\s+[A-Z]\.[A-Z](?:\.\d+)*\.?'
     ]
-    
     combined_pattern = re.compile('|'.join(patterns), re.IGNORECASE)
-    
     jv_refs = []
     for match in combined_pattern.finditer(text):
         raw = match.group(0).strip()
-        
-        # Generer et unikt ID baseret på JV-referencen
         jv_id = re.sub(r'\s+', '_', raw).lower()
         jv_id = re.sub(r'[^\w\-_\.]', '', jv_id)
-        
-        # Udtræk sektion information
-        section = None
-        link_url = ""
-        
-        # Tjek for årstal-version format
+        section, link_url = None, ""
         year_match = re.search(r'(\d{4})-(\d+)', raw)
         section_match = re.search(r'([A-Z]\.[A-Z](?:\.[A-Z])*)', raw, re.IGNORECASE)
-        
         if year_match and section_match:
-            year = year_match.group(1)
-            version = year_match.group(2)
-            section = section_match.group(1).upper()
+            year, version, section = year_match.group(1), year_match.group(2), section_match.group(1).upper()
             link_url = f"https://skat.dk/display.aspx?oid={year}-{version}-{section}"
         else:
-            # Tjek for afsnit-format: "JV afsnit C.F.1.2.3"
             afsnit_match = re.search(r'afsnit\s+([A-Z]\.[A-Z](?:\.\d+)*)', raw, re.IGNORECASE)
             if afsnit_match:
                 section = afsnit_match.group(1).upper()
-        
-        jv_refs.append({
-            "raw": raw,
-            "start": match.start(),
-            "len": len(raw),
-            "jv_id": jv_id,
-            "section": section,
-            "link": link_url
-        })
-    
+        jv_refs.append({"raw": raw, "start": match.start(), "len": len(raw), "jv_id": jv_id, "section": section, "link": link_url})
     return jv_refs
-
 
 def extract_note_anchors(original_text: str, clean_text: str) -> List[Dict[str, Any]]:
     """Udtræk note-ankre fra original tekst og juster positioner til ren tekst."""
     note_anchors = []
-    
-    # Find alle note-markeringer i original tekst
     matches = list(RE_INLINE_NOTE.finditer(original_text))
-    
-    # Beregn offset-justering for hver position
     for match in matches:
         note_id = match.group(1)
         original_pos = match.start()
-        
-        # Beregn hvor mange karakterer der er fjernet før denne position
         text_before = original_text[:original_pos]
         removed_chars = len(text_before) - len(re.sub(r'\(\u200B?\d+\u200B?\)', '', text_before))
-        
-        # Justeret position i ren tekst
-        adjusted_pos = original_pos - removed_chars
-        
-        # Sørg for at position ikke er negativ eller over grænsen
-        adjusted_pos = max(0, min(adjusted_pos, len(clean_text)))
-        
-        note_anchors.append({
-            "note_id": note_id,
-            "start": adjusted_pos,
-            "len": 0  # Indsætningspunkt, ikke eksisterende tekst
-        })
-    
+        adjusted_pos = max(0, min(original_pos - removed_chars, len(clean_text)))
+        note_anchors.append({"note_id": note_id, "start": adjusted_pos, "len": 0})
     return note_anchors
 
-
-
-
-
-
-
+def auto_derive_law_id(filename: str) -> str:
+    """Auto-aflede law_id fra filnavn."""
+    filename = filename.strip()
+    date_nr_match = re.search(r'\((\d{4}-\d{2}-\d{2})\s+nr\.\s*(\d+)\)', filename)
+    suffix = f"{date_nr_match.group(1)}_nr{date_nr_match.group(2)}" if date_nr_match else "unknown"
+    filename_lower = filename.lower()
+    prefixes = {"kildeskat": "KSL", "personskat": "PSL", "selskabsskat": "SSL", "moms": "ML", "afskrivning": "AL", "ligning": "LL", "skatteforvaltning": "SFL"}
+    for key, prefix in prefixes.items():
+        if key in filename_lower:
+            return f"{prefix}_{suffix}"
+    first_word = filename.split()[0] if filename.split() else "UNK"
+    prefix = re.sub(r'[^A-Za-z]', '', first_word)[:3].upper() or "UNK"
+    return f"{prefix}_{suffix}"
 
 def normalize_coordinate(value: str) -> str:
-    """Normalisér koordinat-værdi til atom_id format: små bogstaver, ingen mellemrum."""
-    if not value:
-        return ""
-    # Fjern mellemrum og konverter til små bogstaver: "33 A" → "33a", "10 a)" → "10a"
-    normalized = re.sub(r'[^\w]', '', value).lower()
-    return normalized
+    """Normalisér koordinat-værdi til atom_id format."""
+    return re.sub(r'[^\w]', '', value).lower() if value else ""
 
+def make_atom_base_id(**kwargs) -> str:
+    """Generér base atom_id uden part-suffix."""
+    kwargs['part_info'] = None
+    return make_atom_id(**kwargs)
 
 def make_atom_id(law_id: str, paragraf: Optional[str] = None, stk: Optional[str] = None, 
                  nr: Optional[str] = None, lit: Optional[str] = None, pkt: Optional[str] = None,
                  part_info: Optional[tuple] = None, kind: str = "rule", 
-                 note_id: Optional[str] = None, section: Optional[str] = None) -> str:
-    """Generér deterministisk atom_id efter formatet:
-    law_id--§par--stkstk--nrnr--litlit--pktpkt--parti-of-n--noteN
-    (kind gemmes som separat metadata-felt)
-    """
+                 note_id: Optional[str] = None, section: Optional[str] = None, 
+                 root_id: Optional[str] = None) -> str:
+    """Generér deterministisk atom_id."""
     parts = [law_id]
     
-    # Section-baserede chunks (afsnit/kapitel)
     if section and not paragraf:
-        # For section chunks: law_id--section<normalized>
-        section_norm = normalize_coordinate(section.replace(" ", "_"))
-        parts.append(f"section{section_norm}")
-        return "--".join(parts)
-    
-    # Paragraf-baserede chunks
-    if paragraf:
-        parts.append(f"§{normalize_coordinate(paragraf)}")
-        
-        # Implicit stk. 1 materialiseres
-        if stk:
-            parts.append(f"stk{normalize_coordinate(stk)}")
-        elif nr or kind in ["rule", "definition"]:  # Kun materialisér hvis der er indhold
-            parts.append("stk1")
-            
-        if nr:
-            parts.append(f"nr{normalize_coordinate(nr)}")
-            
-        if lit:
-            parts.append(f"lit{normalize_coordinate(lit)}")
-            
-        if pkt:
-            parts.append(f"pkt{normalize_coordinate(pkt)}")
-    
-    # Split-information
+        parts.append(f"section{normalize_coordinate(section.replace(' ', '_'))}")
+    elif root_id:
+        parts.append(f"root{root_id}")
+    elif paragraf:
+        parts.append(f"par{normalize_coordinate(paragraf)}")
+        eff_stk = stk
+        if stk is None and (nr or lit or pkt or kind in ["rule", "definition"]):
+            eff_stk = "1"
+        if eff_stk:
+            parts.append(f"stk{normalize_coordinate(eff_stk)}")
+        if nr: parts.append(f"nr{normalize_coordinate(nr)}")
+        if lit: parts.append(f"lit{normalize_coordinate(lit)}")
+        if pkt: parts.append(f"pkt{normalize_coordinate(pkt)}")
+
     if part_info and len(part_info) == 2:
-        i, total = part_info
-        parts.append(f"part{i}-of-{total}")
+        parts.append(f"part{part_info[0]}-of-{part_info[1]}")
     
-    # Note-specifik information
+    parts.append(f"kind{kind}")
+    
     if note_id:
         parts.append(f"note{note_id}")
     
-    return "--".join(parts)
-
+    return "--".join(filter(None, parts))
 
 def make_chunk_id(paragraf: Optional[str], stk: Optional[str] = None, nr: Optional[str] = None,
-                  *, section: Optional[str] = None, parent_label: Optional[str] = None) -> str:
-    if section is not None:
-        base = f"{section}"
-        if parent_label:
-            return f"{base} (parent)"
-        return base
-    parts: List[str] = []
-    if paragraf:
-        parts.append(f"§ {paragraf}")
+                  lit: Optional[str] = None, pkt: Optional[str] = None,
+                  *, section: Optional[str] = None, parent_label: Optional[str] = None, 
+                  root_id: Optional[str] = None) -> str:
+    if section:
+        return f"{section}{' (parent)' if parent_label else ''}"
     
-    # FIX: Entydige IDs for parent
-    if parent_label == 'paragraf_parent':
-        return (', '.join(parts) + " (parent)") if parts else 'root'
+    parts = []
+    if paragraf: parts.append(f"§ {paragraf}")
+    if parent_label == 'paragraf_parent': return f"{', '.join(parts)} (parent)" if parts else 'root'
     
-    if stk is not None:
-        parts.append(f"stk. {stk}")
-    if parent_label == 'stk_parent':
-        return (', '.join(parts) + " (parent)") if parts else 'root'
-    if nr is not None:
-        parts.append(f"nr. {nr}")
-    return ', '.join(parts) if parts else 'root'
+    if stk: parts.append(f"stk. {stk}")
+    if parent_label == 'stk_parent': return f"{', '.join(parts)} (parent)" if parts else 'root'
+    
+    if nr: parts.append(f"nr. {nr}")
+    if lit: parts.append(f"lit. {lit}")
+    if pkt: parts.append(f"pkt. {pkt}")
+    
+    if not parts:
+        return f"root-{root_id}" if root_id else 'root'
+    
+    return ', '.join(parts)
 
-
-# ------------------------------
-# Parsing af dokument → basis‑chunks
-# ------------------------------
-
-def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
+def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
     """Returnér (chunks, note_bodies, note_uuid_map)."""
-    # 1) Opsamling af note‑kroppe nederst
-    note_bodies: Dict[str, str] = {}
-    cur_id: Optional[str] = None
-    cur_buf: List[str] = []
+    note_bodies, cur_id, cur_buf = {}, None, []
+    root_counter = 1
+
     def flush_note() -> None:
         nonlocal cur_id, cur_buf
-        if cur_id is None:
-            return
-        note_bodies[cur_id] = ' '.join(cur_buf).strip()
+        if cur_id: note_bodies[cur_id] = ' '.join(cur_buf).strip()
         cur_id, cur_buf = None, []
 
     for ln in lines:
@@ -649,832 +475,433 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             flush_note()
             cur_id = m.group(1)
             cur_buf = [ln[m.end():]]
-        else:
-            if cur_id is not None:
-                cur_buf.append(ln)
+        elif cur_id:
+            cur_buf.append(ln)
     flush_note()
 
-    # 2) Struktur‑parse
     chunks: List[Dict[str, Any]] = []
-    ctx = {"section": None, "paragraf": None, "stk": None, "nr": None, "buf": []}
+    ctx = {"section": None, "paragraf": None, "stk": None, "nr": None, "lit": None, "pkt": None, "buf": []}
 
     def flush_chunk() -> None:
+        nonlocal root_counter
         body = ' '.join(ctx["buf"]).strip()
         if not body:
-            ctx["buf"] = []
-            return
-        # FIX: Skip hvis ingen aktiv struktur (undgå "root" støj fra YAML front matter)
-        if not ctx["paragraf"] and not ctx["section"]:
-            # Extra check: skip if content looks like YAML front matter or metadata
-            if body.startswith('---') or 'source_file:' in body or 'converted_at:' in body:
-                print(f"🧹 Skipping YAML/metadata chunk: {body[:50]}...")
-                ctx["buf"] = []
-                return
-            ctx["buf"] = []
-            return
-        # niveau
-        if ctx["paragraf"] and ctx["stk"] is None and ctx["nr"] is None:
-            eff_stk = "1"
-            level = "stk"
-        else:
-            eff_stk = ctx["stk"]
-            level = "nr" if ctx["nr"] is not None else ("stk" if ctx["stk"] is not None else "paragraf")
+            ctx["buf"] = []; return
         
-        # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
+        is_root = not ctx["paragraf"] and not ctx["section"]
+        if is_root and (body.startswith('---') or 'source_file:' in body):
+            print(f"🧹 Skipping YAML/metadata chunk: {body[:50]}...")
+            sys.stdout.flush()
+            ctx["buf"] = []; return
+        
+        level, kind, current_root_id = "rule", "rule", None
+        if is_root:
+            level, kind, current_root_id = "root", "root", str(root_counter)
+            print(f"📝 FLUSH: Processing root chunk #{current_root_id}: {body[:50]}...")
+            sys.stdout.flush()
+            root_counter += 1
+        else:
+            levels = [("pkt", ctx["pkt"]), ("lit", ctx["lit"]), ("nr", ctx["nr"]), ("stk", ctx["stk"]), ("paragraf", ctx["paragraf"])]
+            level = next((lvl for lvl, val in levels if val is not None), "paragraf")
+
         text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', body).strip()
         
-        # Udtræk alle metadata med korrekte positioner
-        note_anchors = extract_note_anchors(body, text_plain)  # Juster positioner til ren tekst
-        dom_refs = extract_dom_references(text_plain)
-        jv_refs = extract_jv_references(text_plain)
+        common_metadata = {
+            "note_anchors": extract_note_anchors(body, text_plain),
+            "dom_refs": extract_dom_references(text_plain),
+            "jv_refs": extract_jv_references(text_plain),
+        }
+        common_metadata["note_refs"] = [a["note_id"] for a in common_metadata["note_anchors"]]
+
+        eff_stk = ctx["stk"]
+        if ctx["paragraf"] and not eff_stk and (ctx["nr"] or ctx["lit"] or ctx["pkt"]):
+            eff_stk = "1"
         
-        # Udtræk note_ids for kompatibilitet
-        note_ids = [anchor["note_id"] for anchor in note_anchors]
+        atom_kwargs = {
+            "law_id": law_id, "paragraf": ctx["paragraf"], "stk": eff_stk,
+            "nr": ctx["nr"], "lit": ctx["lit"], "pkt": ctx["pkt"],
+            "kind": kind, "root_id": current_root_id
+        }
         
-        # Bestem kind baseret på level og indhold
-        if level == "nr":
-            kind = "rule"
-        elif level == "stk":
-            kind = "rule"
-        elif level == "paragraf":
-            kind = "rule"
-        else:
-            kind = "rule"  # Default
+        chunk_data = {
+            "uuid": generate_chunk_uuid(),
+            "chunk_id": make_chunk_id(**ctx, stk=eff_stk, root_id=current_root_id),
+            "atom_id": make_atom_id(**atom_kwargs),
+            "atom_base_id": make_atom_base_id(**atom_kwargs),
+            "kind": kind, "level": level, "text_plain": text_plain,
+            "note_uuids": [], "part_index": 1, "part_total": 1, "split_reason": None,
+            **ctx, "stk": eff_stk, **common_metadata
+        }
         
-        # Generér atom_id
-        law_id = "KSL_2025-04-11_nr460"  # Fast for denne lov
-        atom_id = make_atom_id(
-            law_id=law_id,
-            paragraf=ctx["paragraf"],
-            stk=eff_stk,
-            nr=ctx["nr"],
-            kind=kind
-        )
-        
-        chunks.append({
-            "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
-            "chunk_id": make_chunk_id(ctx["paragraf"], eff_stk, ctx["nr"], section=None),
-            "atom_id": atom_id,  # Ny deterministisk ID
-            "kind": kind,  # Ny atomtype
-            "level": level,
-            "section_label": ctx["section"],
-            "paragraf": ctx["paragraf"],
-            "stk": eff_stk,
-            "nr": ctx["nr"],
-            "text_plain": text_plain,
-            "note_anchors": note_anchors,
-            "dom_refs": dom_refs,
-            "jv_refs": jv_refs,
-            "note_refs": note_ids,  # Bevar for kompatibilitet
-            "note_uuids": [],  # Vil blive udfyldt senere
-            # Split-ready struktur (klar til aktivering)
-            "part_index": 1,
-            "part_total": 1,
-            "split_reason": None,
-        })
+        print(f"-> CREATING: chunk_id='{chunk_data['chunk_id']}', atom_id='{chunk_data['atom_id']}'")
+        sys.stdout.flush()
+        chunks.append(chunk_data)
         ctx["buf"] = []
 
-    current_section_label: Optional[str] = None
-
     for raw in lines:
-        # Afsnit/kapitel‑linje
-        m_sec = RE_SECTION.match(raw)
-        if m_sec and not raw.startswith('##') and not raw.startswith('###'):
-            # flush forrige chunk
-            flush_chunk()
-            section_type, section_title = m_sec.groups()
-            current_section_label = f"{section_type} {section_title}"
-            ctx.update({"section": current_section_label, "paragraf": None, "stk": None, "nr": None, "buf": []})
-            # selve overskriften som chunk (level=afsnit)
-            # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
-            text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', current_section_label).strip()
-            
-            # Udtræk metadata med korrekte positioner
-            note_anchors = extract_note_anchors(current_section_label, text_plain)
-            dom_refs = extract_dom_references(text_plain)
-            jv_refs = extract_jv_references(text_plain)
-            
-            # Udtræk note_ids for kompatibilitet
-            note_ids = [anchor["note_id"] for anchor in note_anchors]
-            
-            # Section chunks er af type "section"
-            law_id = "KSL_2025-04-11_nr460"
-            atom_id = make_atom_id(
-                law_id=law_id,
-                section=current_section_label,
-                kind="section"
-            )
-            
-            chunks.append({
-                "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
-                "chunk_id": make_chunk_id(None, section=current_section_label),
-                "atom_id": atom_id,  # Ny deterministisk ID
-                "kind": "section",  # Ny atomtype
-                "level": "afsnit",
-                "section_label": current_section_label,
-                "paragraf": None, "stk": None, "nr": None,
-                "text_plain": text_plain,
-                "note_anchors": note_anchors,
-                "dom_refs": dom_refs,
-                "jv_refs": jv_refs,
-                "note_refs": note_ids,
-                "note_uuids": [],
-                # Split-ready struktur (klar til aktivering)
-                "part_index": 1,
-                "part_total": 1,
-                "split_reason": None,
-            })
-            continue
+        if raw.strip().startswith("---") and not ctx["paragraf"]: continue
         
-        # Paragraf‑linje m. mulig introhale
-        m_p = RE_PARAGRAF.match(raw)
-        if m_p:
-            flush_chunk()
-            pnum, tail = m_p.groups()
-            # DEBUG: print(f"🔍 Found paragraf: '{pnum}' (from line: {raw[:50]}...)")
-            ctx.update({"paragraf": pnum, "stk": None, "nr": None, "buf": []})
-            tail = tail.strip()
-            if tail:
-                # Behandl som implicit stk. 1 i stedet for paragraf_intro
-                ctx["stk"] = "1"  # Sæt implicit stk. 1
-                clean_tail = strip_structural_markers(tail, "body")  # Kun fjern markdown
-                ctx["buf"] = [clean_tail] if clean_tail else []
-            continue
+        match_found = False
+        patterns = [
+            (RE_SECTION, lambda m: ctx.update({"section": f"{m.group(1)} {m.group(2)}", "paragraf": None, "stk": None, "nr": None, "lit": None, "pkt": None})),
+            (RE_PARAGRAF, lambda m: (ctx.update({"paragraf": m.group(1), "stk": "1" if m.group(2).strip() else None, "nr": None, "lit": None, "pkt": None, "buf": [strip_structural_markers(m.group(2))] if m.group(2).strip() else []}))),
+            (RE_STK, lambda m: ctx.update({"stk": m.group(1), "nr": None, "lit": None, "pkt": None, "buf": [strip_structural_markers(raw, "stk")]})),
+            (RE_NR, lambda m: ctx.update({"nr": m.group(1), "lit": None, "pkt": None, "buf": [strip_structural_markers(raw, "nr")]}) or (not ctx["stk"] and ctx.update({"stk": "1"}))),
+            (RE_LITRA, lambda m: ctx.update({"lit": m.group(1).lower(), "pkt": None, "buf": [strip_structural_markers(raw, "litra")]}) or (not ctx["nr"] and ctx.update({"nr": "1"})) or (not ctx["stk"] and ctx.update({"stk": "1"}))),
+            (RE_PUNKT, lambda m: ctx.update({"pkt": m.group(1), "buf": [strip_structural_markers(raw, "punkt")]}) or (not ctx["lit"] and ctx.update({"lit": "a"})) or (not ctx["nr"] and ctx.update({"nr": "1"})) or (not ctx["stk"] and ctx.update({"stk": "1"})))
+        ]
         
-        # Stk.
-        m_s = RE_STK.match(raw)
-        if m_s:
-            flush_chunk()
-            s = m_s.group(1)
-            # DEBUG: print(f"🔍 Found stk: '{s}' (from line: {raw[:50]}...)")
-            # FIX: Brug strip_structural_markers for ren tekst
-            clean_text = strip_structural_markers(raw, "stk")
-            ctx.update({"stk": s, "nr": None, "buf": [clean_text] if clean_text else []})
-            continue
+        for pattern, action in patterns:
+            m = pattern.match(raw)
+            if m and (pattern != RE_SECTION or not raw.startswith('##')):
+                flush_chunk()
+                action(m)
+                if pattern == RE_SECTION:
+                    flush_chunk()
+                match_found = True
+                break
         
-        # Nr.
-        m_n = RE_NR.match(raw)
-        if m_n:
-            flush_chunk()
-            if ctx["stk"] is None:
-                ctx["stk"] = "1"
-            n = m_n.group(1)
-            # DEBUG: print(f"🔍 Found nr: '{n}' (from line: {raw[:50]}...)")
-            # FIX: Brug strip_structural_markers for ren tekst
-            clean_text = strip_structural_markers(raw, "nr")
-            ctx.update({"nr": n, "buf": [clean_text] if clean_text else []})
-            continue
-        
-        # Akkumuler brødtekst - FIX: Brug strip_structural_markers for ren tekst
-        ctx["buf"].append(strip_structural_markers(raw, "body"))
+        if not match_found:
+            ctx["buf"].append(strip_structural_markers(raw))
 
     flush_chunk()
 
-    # Note‑chunks som selvstændige noder
-    note_uuid_map = {}  # Map note_id -> uuid
+    note_uuid_map = {}
     for nid, ntext in note_bodies.items():
         note_uuid = generate_chunk_uuid()
         note_uuid_map[nid] = note_uuid
-        
-        # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
         text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', ntext).strip()
-        
-        # Udtræk metadata med korrekte positioner
-        note_anchors = extract_note_anchors(ntext, text_plain)
-        dom_refs = extract_dom_references(text_plain)
-        jv_refs = extract_jv_references(text_plain)
-        
-        # Note chunks er af type "note"
-        law_id = "KSL_2025-04-11_nr460"
-        atom_id = make_atom_id(
-            law_id=law_id,
-            kind="note",
-            note_id=nid
-        )
-        
+        atom_kwargs = {"law_id": law_id, "kind": "note", "note_id": nid}
         chunks.append({
-            "uuid": note_uuid,
-            "chunk_id": f"note({nid})",
-            "atom_id": atom_id,  # Ny deterministisk ID
-            "kind": "note",  # Ny atomtype
-            "level": "note",
-            "section_label": None,
-            "paragraf": None, "stk": None, "nr": None,
-            "text_plain": text_plain,
-            "note_anchors": note_anchors,
-            "dom_refs": dom_refs,
-            "jv_refs": jv_refs,
-            "referenced_by": [],  # Vil blive udfyldt senere
-            # Split-ready struktur (klar til aktivering)
-            "note_id": int(nid),  # Stabil note-id som int
-            "part_index": 1,
-            "part_total": 1,
-            "split_reason": None,
+            "uuid": note_uuid, "chunk_id": f"note({nid})",
+            "atom_id": make_atom_id(**atom_kwargs), "atom_base_id": make_atom_base_id(**atom_kwargs),
+            "kind": "note", "level": "note", "text_plain": text_plain,
+            "section_label": None, "paragraf": None, "stk": None, "nr": None, "lit": None, "pkt": None,
+            "note_anchors": extract_note_anchors(ntext, text_plain),
+            "dom_refs": extract_dom_references(text_plain), "jv_refs": extract_jv_references(text_plain),
+            "referenced_by": [], "note_id": int(nid),
+            "part_index": 1, "part_total": 1, "split_reason": None,
         })
-
     return chunks, note_bodies, note_uuid_map
 
 
 def build_cross_references(chunks: List[Dict[str, Any]], note_uuid_map: Dict[str, str]) -> None:
     """Build cross-references between chunks and notes."""
-    # Map note_id -> list of chunk UUIDs that reference it
     note_references = {}
-    
     for chunk in chunks:
         chunk_uuid = chunk.get("uuid")
-        note_refs = chunk.get("note_refs", [])
-        
-        # Build note_uuids list for this chunk
-        note_uuids = []
+        note_refs = [a["note_id"] for a in chunk.get("note_anchors", [])]
+        chunk["note_refs"] = note_refs
+        chunk["note_uuids"] = [note_uuid_map[nid] for nid in note_refs if nid in note_uuid_map]
         for note_id in note_refs:
             if note_id in note_uuid_map:
-                note_uuid = note_uuid_map[note_id]
-                note_uuids.append(note_uuid)
-                # Track reverse reference
-                if note_id not in note_references:
-                    note_references[note_id] = []
+                if note_id not in note_references: note_references[note_id] = []
                 note_references[note_id].append(chunk_uuid)
-        
-        chunk["note_uuids"] = note_uuids
     
-    # Update note chunks with referenced_by information
     for chunk in chunks:
         if chunk.get("level") == "note":
-            chunk_id = chunk.get("chunk_id", "")
-            # Extract note_id from "note(14)" format
-            if chunk_id.startswith("note(") and chunk_id.endswith(")"):
-                note_id = chunk_id[5:-1]  # Remove "note(" and ")"
-                chunk["referenced_by"] = note_references.get(note_id, [])
-
+            note_id = str(chunk.get("note_id"))
+            chunk["referenced_by"] = note_references.get(note_id, [])
 
 def apply_note_context(chunks: List[Dict[str, Any]]) -> None:
     """Apply context from first referencing chunk to note chunks."""
-    # Create UUID lookup for quick access
     chunk_by_uuid = {chunk["uuid"]: chunk for chunk in chunks}
-    
     for chunk in chunks:
-        if chunk.get("level") == "note":
-            referenced_by = chunk.get("referenced_by", [])
-            if referenced_by:
-                # Get first referencing chunk
-                first_ref_uuid = referenced_by[0]
-                if first_ref_uuid in chunk_by_uuid:
-                    parent_chunk = chunk_by_uuid[first_ref_uuid]
-                    
-                    # Copy context from parent to note
-                    chunk["section_label"] = parent_chunk.get("section_label")
-                    chunk["paragraf"] = parent_chunk.get("paragraf") 
-                    chunk["stk"] = parent_chunk.get("stk")
-                    chunk["nr"] = parent_chunk.get("nr")
+        if chunk.get("level") == "note" and chunk.get("referenced_by"):
+            parent_chunk = chunk_by_uuid.get(chunk["referenced_by"][0])
+            if parent_chunk:
+                for key in ["section_label", "paragraf", "stk", "nr", "lit", "pkt"]:
+                    chunk[key] = parent_chunk.get(key)
 
-
-def clean_orphaned_note_references(chunks: List[Dict[str, Any]], note_uuid_map: Dict[str, str]) -> None:
-    """Remove note references that don't have corresponding note chunks."""
-    valid_note_ids = set(note_uuid_map.keys())
-    
+def update_note_atom_ids_with_context(chunks: List[Dict[str, Any]], law_id: str) -> None:
+    """Opdater note atom_ids til at inkludere koordinat-kontekst."""
     for chunk in chunks:
-        if chunk.get("level") == "note":
-            continue  # Skip note chunks themselves
-            
-        # Clean note_refs (for kompatibilitet)
-        original_note_refs = chunk.get("note_refs", [])
-        cleaned_note_refs = [nid for nid in original_note_refs if nid in valid_note_ids]
-        chunk["note_refs"] = cleaned_note_refs
-        
-        # Clean note_uuids accordingly (for kompatibilitet)
-        cleaned_note_uuids = [note_uuid_map[nid] for nid in cleaned_note_refs]
-        chunk["note_uuids"] = cleaned_note_uuids
-        
-        # Clean note_anchors metadata - fjern ugyldige note-ankre
-        original_note_anchors = chunk.get("note_anchors", [])
-        cleaned_note_anchors = [
-            anchor for anchor in original_note_anchors 
-            if anchor.get("note_id") in valid_note_ids
-        ]
-        chunk["note_anchors"] = cleaned_note_anchors
-        
-        # Report cleaning if any orphaned refs were found
-        orphaned_refs = set(original_note_refs) - set(cleaned_note_refs)
-        orphaned_anchors = len(original_note_anchors) - len(cleaned_note_anchors)
-        
-        if orphaned_refs or orphaned_anchors > 0:
-            if orphaned_refs:
-                print(f"🧹 Cleaned orphaned note refs {orphaned_refs} from {chunk.get('chunk_id', 'unknown')}")
-            if orphaned_anchors > 0:
-                print(f"🧹 Cleaned {orphaned_anchors} orphaned note anchors from {chunk.get('chunk_id', 'unknown')}")
+        if chunk.get("level") == "note" and chunk.get("paragraf"):
+            atom_kwargs = {
+                "law_id": law_id, "kind": "note", "note_id": str(chunk.get("note_id")),
+                "paragraf": chunk.get("paragraf"), "stk": chunk.get("stk"), "nr": chunk.get("nr"),
+                "lit": chunk.get("lit"), "pkt": chunk.get("pkt")
+            }
+            new_atom_id = make_atom_id(**atom_kwargs)
+            new_atom_base_id = make_atom_base_id(**atom_kwargs)
+            if chunk["atom_id"] != new_atom_id:
+                print(f"🔄 Note atom_id opdateret: {chunk['atom_id']} → {new_atom_id}")
+                sys.stdout.flush()
+                chunk["atom_id"], chunk["atom_base_id"] = new_atom_id, new_atom_base_id
 
-
-# ------------------------------
-# Parent‑generation
-# ------------------------------
+def validate_atom_id_uniqueness(chunks: List[Dict[str, Any]]) -> None:
+    """Validér at alle atom_id'er er unikke."""
+    from collections import Counter
+    atom_ids = [c["atom_id"] for c in chunks if "atom_id" in c]
+    counts = Counter(atom_ids)
+    duplicates = {id: count for id, count in counts.items() if count > 1}
+    
+    if duplicates:
+        print("❌ KRITISK FEJL: Dublerede atom_id'er fundet!")
+        sys.stdout.flush()
+        for dup_id, count in duplicates.items():
+            print(f"   🔴 Duplikat: {dup_id} (forekommer {count} gange)")
+            matching_chunks = [c for c in chunks if c.get("atom_id") == dup_id]
+            for i, chunk in enumerate(matching_chunks):
+                print(f"      [{i+1}] chunk_id: '{chunk.get('chunk_id')}', level: {chunk.get('level')}, kind: {chunk.get('kind')}")
+        raise ValueError(f"Atom_ID unikhedskrav overtrådt! {len(duplicates)} dublerede ID'er fundet.")
 
 def index_by_hierarchy(chunks: List[Dict[str, Any]]):
-    by_p: Dict[str, List[Dict[str, Any]]] = {}
-    by_ps: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    by_psn: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    paragraf_intro: Dict[str, Dict[str, Any]] = {}
-    section_to_paragrafs: Dict[str, List[str]] = {}
-
+    by_p, by_ps, by_psn, paragraf_intro, section_to_paragrafs = {}, {}, {}, {}, {}
     for c in chunks:
-        level = c.get("level")
-        p, s, n = c.get("paragraf"), c.get("stk"), c.get("nr")
-        sec = c.get("section_label")
+        p, s, n, sec, level = c.get("paragraf"), c.get("stk"), c.get("nr"), c.get("section_label"), c.get("level")
         if level == 'paragraf_intro' and p:
             paragraf_intro[p] = c
             if sec:
-                section_to_paragrafs.setdefault(sec, []).append(p)
+                if sec not in section_to_paragrafs: section_to_paragrafs[sec] = []
+                section_to_paragrafs[sec].append(p)
         if p:
-            by_p.setdefault(p, []).append(c)
-        if p and s is not None:
-            by_ps.setdefault((p, s), []).append(c)
-        if p and s is not None and n is not None:
+            if p not in by_p: by_p[p] = []
+            by_p[p].append(c)
+        if p and s:
+            if (p, s) not in by_ps: by_ps[(p, s)] = []
+            by_ps[(p, s)].append(c)
+        if p and s and n:
             by_psn[(p, s, n)] = c
     return by_p, by_ps, by_psn, paragraf_intro, section_to_paragrafs
-
 
 def collect_children(chunks: List[Dict[str, Any]], p: str, s: Optional[str] = None) -> List[Dict[str, Any]]:
     out = []
     for c in chunks:
-        if c.get("paragraf") != p:
-            continue
+        if c.get("paragraf") != p: continue
         if s is None:
-            # alle stykker og nr under §
-            if c.get("level") in ("stk", "stk_parent") and c.get("nr") is None:
-                out.append(c)
+            if c.get("level") in ("stk", "stk_parent") and c.get("nr") is None: out.append(c)
         else:
-            # s er specificeret - find nr-børn under dette stykke
-            if c.get("stk") == s and c.get("level") == 'nr':
-                out.append(c)
-    # stabil orden: efter nr/stk med naturlig sortering af tal+bogstav
+            if c.get("stk") == s and c.get("level") == 'nr': out.append(c)
+    
     def natural_sort_key(chunk):
-        nr = chunk.get("nr")
-        stk = chunk.get("stk")
-        
-        # Parse nr (kan være "10", "10a", "10 a", etc.)
-        nr_num = 999999  # fallback for ikke-numeriske
-        nr_letter = ""
-        if nr is not None:
-            nr_str = str(nr).strip()
-            # Find tal-delen
-            import re
-            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', nr_str)
-            if match:
-                nr_num = int(match.group(1))
-                nr_letter = match.group(2) or ""
-        
-        # Parse stk (kan være "1", "2a", etc.)
-        stk_num = 999999  # fallback
-        stk_letter = ""
-        if stk is not None:
-            stk_str = str(stk).strip()
-            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', stk_str)
-            if match:
-                stk_num = int(match.group(1))
-                stk_letter = match.group(2) or ""
-        
+        nr, stk = chunk.get("nr"), chunk.get("stk")
+        nr_num, nr_letter = (9999, "")
+        if nr:
+            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', str(nr).strip())
+            if match: nr_num, nr_letter = int(match.group(1)), match.group(2) or ""
+        stk_num, stk_letter = (9999, "")
+        if stk:
+            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', str(stk).strip())
+            if match: stk_num, stk_letter = int(match.group(1)), match.group(2) or ""
         return (nr_num, nr_letter, stk_num, stk_letter)
     
     out.sort(key=natural_sort_key)
     return out
 
-
 def build_anchor_map_from_children(children: List[Dict[str, Any]]) -> Dict[str, str]:
-    m: Dict[str, str] = {}
+    m = {}
     for ch in children:
-        for nid in ch.get("note_refs", []) or []:
+        for nid in ch.get("note_refs", []):
             m.setdefault(nid, ch.get("chunk_id"))
     return m
 
-
 def make_stk_parent(chunks: List[Dict[str, Any]], p: str, s: str,
-                    paragraf_intro_c: Optional[Dict[str, Any]], 
+                    paragraf_intro_c: Optional[Dict[str, Any]], law_id: str,
                     use_llm: bool = False, llm=None) -> Optional[Dict[str, Any]]:
-    # find nr‑børn
     nr_children = collect_children(chunks, p, s)
-    if not nr_children:
-        return None
-    # Generate content with LLM if enabled
+    if not nr_children: return None
+    
     if use_llm and llm:
-        llm_text = generate_llm_bullets(nr_children, "stk_parent", llm)
-        if llm_text:
-            text_plain = llm_text
-        else:
-            # Fallback to rule-based
-            intro = intro_no_ellipses((paragraf_intro_c or {}).get("text_plain", "").strip()) if paragraf_intro_c else ""
-            intro = intro or f"Stk. {s} indeholder underpunkter (nr.)."
-            bullets = []
-            for ch in nr_children:
-                nr = ch.get("nr")
-                ess = summarize_bullet_no_ellipses(ch.get("text_plain", ""))
-                bullets.append(f"nr. {nr} — {ess}")
-            text_plain = intro + "\n" + "\n".join(f"• {b}" for b in bullets)
-    else:
-        # Rule-based generation
-        intro = intro_no_ellipses((paragraf_intro_c or {}).get("text_plain", "").strip()) if paragraf_intro_c else ""
-        intro = intro or f"Stk. {s} indeholder underpunkter (nr.)."
-        bullets = []
-        for ch in nr_children:
-            nr = ch.get("nr")
-            ess = summarize_bullet_no_ellipses(ch.get("text_plain", ""))
-            bullets.append(f"nr. {nr} — {ess}")
+        text_plain = generate_llm_bullets(nr_children, "stk_parent", llm)
+    if not use_llm or not llm or not text_plain:
+        intro = intro_no_ellipses((paragraf_intro_c or {}).get("text_plain", "").strip()) or f"Stk. {s} indeholder underpunkter (nr.)."
+        bullets = [f"nr. {ch.get('nr')} — {summarize_bullet_no_ellipses(ch.get('text_plain', ''))}" for ch in nr_children]
         text_plain = intro + "\n" + "\n".join(f"• {b}" for b in bullets)
 
-    children_ids = [c.get("chunk_id") for c in nr_children]
-    anchor_map = build_anchor_map_from_children(nr_children)
-
-    # FIX: Post-tjek for ellipser
     text_plain = clean_ellipses_from_text(text_plain)
     
-    # Parent chunks indeholder genereret tekst uden note-markeringer
-    text_plain_clean = text_plain.strip()
-    
-    # Udtræk metadata fra parent tekst (ingen note-ankre i genereret tekst)
-    note_anchors = []  # Parent chunks har ingen note-ankre
-    dom_refs = extract_dom_references(text_plain_clean)
-    jv_refs = extract_jv_references(text_plain_clean)
-
-    # Parent chunks er af type "parent"
-    law_id = "KSL_2025-04-11_nr460"
-    atom_id = make_atom_id(
-        law_id=law_id,
-        paragraf=p,
-        stk=s,
-        kind="parent"
-    )
-    
+    atom_kwargs = {"law_id": law_id, "paragraf": p, "stk": s, "kind": "parent"}
     return {
-        "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
-        "chunk_id": make_chunk_id(p, s, None, parent_label='stk_parent'),
-        "atom_id": atom_id,  # Ny deterministisk ID
-        "kind": "parent",  # Ny atomtype
-        "level": "stk_parent",
+        "uuid": generate_chunk_uuid(),
+        "chunk_id": make_chunk_id(p, s, parent_label='stk_parent'),
+        "atom_id": make_atom_id(**atom_kwargs),
+        "atom_base_id": make_atom_base_id(**atom_kwargs),
+        "kind": "parent", "level": "stk_parent",
         "section_label": nr_children[0].get("section_label"),
-        "paragraf": p, "stk": s, "nr": None,
-        "text_plain": text_plain_clean,
-        "note_anchors": note_anchors,
-        "dom_refs": dom_refs,
-        "jv_refs": jv_refs,
-        "note_refs": [],
-        "note_uuids": [],
-        "children": children_ids,
+        "paragraf": p, "stk": s, "nr": None, "text_plain": text_plain,
+        "note_anchors": [], "dom_refs": extract_dom_references(text_plain), "jv_refs": extract_jv_references(text_plain),
+        "note_refs": [], "note_uuids": [],
+        "children": [c.get("chunk_id") for c in nr_children],
         "nr_index": [{"nr": c.get("nr"), "child_id": c.get("chunk_id"), "has_notes": bool(c.get("note_refs"))} for c in nr_children],
-        "anchor_map": anchor_map,
-        "created_from": {"paragraf_intro_id": (paragraf_intro_c or {}).get("chunk_id"), "child_ids": children_ids},
-        # Split-ready struktur (klar til aktivering)
-        "part_index": 1,
-        "part_total": 1,
-        "split_reason": None,
+        "anchor_map": build_anchor_map_from_children(nr_children),
+        "created_from": {"paragraf_intro_id": (paragraf_intro_c or {}).get("chunk_id"), "child_ids": [c.get("chunk_id") for c in nr_children]},
+        "part_index": 1, "part_total": 1, "split_reason": None,
     }
-
 
 def make_paragraf_parent(chunks: List[Dict[str, Any]], p: str,
-                         paragraf_intro_c: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    # find stk‑børn (brug stk_parent hvis den senere tilføjes; ellers stk)
+                         paragraf_intro_c: Optional[Dict[str, Any]], law_id: str) -> Optional[Dict[str, Any]]:
     all_stk_candidates = [c for c in chunks if c.get("paragraf") == p and c.get("level") in ("stk_parent", "stk") and c.get("nr") is None]
-    if not all_stk_candidates:
-        return None
+    if not all_stk_candidates: return None
     
-    # FIX: Deduplikér - prioriter stk_parent over stk for samme stykke
-    stk_children = []
-    stk_seen = set()
-    
-    # Først tilføj alle stk_parent chunks
-    for c in all_stk_candidates:
-        if c.get("level") == "stk_parent":
-            stk_num = c.get("stk")
-            if stk_num not in stk_seen:
-                stk_children.append(c)
-                stk_seen.add(stk_num)
-    
-    # Derefter tilføj stk chunks kun hvis der ikke allerede er en stk_parent
-    for c in all_stk_candidates:
-        if c.get("level") == "stk":
-            stk_num = c.get("stk")
-            if stk_num not in stk_seen:
-                stk_children.append(c)
-                stk_seen.add(stk_num)
-    
-    # FIX: Naturlig sortering som i collect_children - håndterer "1", "1a", "1b", "2", "2a" korrekt
+    stk_children, stk_seen = [], set()
+    for c in sorted(all_stk_candidates, key=lambda x: 1 if x.get("level") == "stk" else 0):
+        stk_num = c.get("stk")
+        if stk_num not in stk_seen:
+            stk_children.append(c)
+            stk_seen.add(stk_num)
+
     def natural_sort_key_for_stk(chunk):
         stk = chunk.get("stk")
-        stk_num = 999999  # fallback
-        stk_letter = ""
-        if stk is not None:
-            stk_str = str(stk).strip()
-            import re
-            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', stk_str)
-            if match:
-                stk_num = int(match.group(1))
-                stk_letter = match.group(2) or ""
+        stk_num, stk_letter = (9999, "")
+        if stk:
+            match = re.match(r'^(\d+)(?:\s*([a-zA-Z]+))?', str(stk).strip())
+            if match: stk_num, stk_letter = int(match.group(1)), match.group(2) or ""
         return (stk_num, stk_letter)
     stk_children.sort(key=natural_sort_key_for_stk)
+
     intro = intro_no_ellipses((paragraf_intro_c or {}).get("text_plain", "").strip()) or f"§ {p} indeholder følgende stykker:"
-    bullets = []
+    bullets = [f"stk. {ch.get('stk')} — {summarize_bullet_no_ellipses(ch.get('text_plain', ''))}" for ch in stk_children]
+    text_plain = clean_ellipses_from_text(intro + "\n" + "\n".join(f"• {b}" for b in bullets))
+    
+    anchor_map = {}
     for ch in stk_children:
-        s = ch.get("stk")
-        # Forsøg at destillere en kort essens
-        basis = ch.get("text_plain", "")
-        ess = summarize_bullet_no_ellipses(basis)
-        bullets.append(f"stk. {s} — {ess}")
-    text_plain = intro + "\n" + "\n".join(f"• {b}" for b in bullets)
-
-    # anchor_map: aggregation fra alle underliggende (brug laveste niveau barnet vi har)
-    anchor_map: Dict[str, str] = {}
-    for ch in stk_children:
-        # helst mappes til nr‑børn hvis de findes
         nr_children = collect_children(chunks, p, ch.get("stk"))
-        if nr_children:
-            for nid, cid in build_anchor_map_from_children(nr_children).items():
-                anchor_map.setdefault(nid, cid)
-        # ellers til selve stk‑barnet
-        for nid in ch.get("note_refs", []) or []:
-            anchor_map.setdefault(nid, ch.get("chunk_id"))
-
-    children_ids = [c.get("chunk_id") for c in stk_children]
-    section_label = stk_children[0].get("section_label")
-
-    # FIX: Post-tjek for ellipser
-    text_plain = clean_ellipses_from_text(text_plain)
+        source_children = nr_children if nr_children else [ch]
+        for nid, cid in build_anchor_map_from_children(source_children).items():
+            anchor_map.setdefault(nid, cid)
     
-    # Parent chunks indeholder genereret tekst uden note-markeringer
-    text_plain_clean = text_plain.strip()
-    
-    # Udtræk metadata fra parent tekst (ingen note-ankre i genereret tekst)
-    note_anchors = []  # Parent chunks har ingen note-ankre
-    dom_refs = extract_dom_references(text_plain_clean)
-    jv_refs = extract_jv_references(text_plain_clean)
-
-    # Parent chunks er af type "parent"
-    law_id = "KSL_2025-04-11_nr460"
-    atom_id = make_atom_id(
-        law_id=law_id,
-        paragraf=p,
-        kind="parent"
-    )
-    
+    atom_kwargs = {"law_id": law_id, "paragraf": p, "kind": "parent"}
     return {
-        "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
+        "uuid": generate_chunk_uuid(),
         "chunk_id": make_chunk_id(p, parent_label='paragraf_parent'),
-        "atom_id": atom_id,  # Ny deterministisk ID
-        "kind": "parent",  # Ny atomtype
-        "level": "paragraf_parent",
-        "section_label": section_label,
-        "paragraf": p, "stk": None, "nr": None,
-        "text_plain": text_plain_clean,
-        "note_anchors": note_anchors,
-        "dom_refs": dom_refs,
-        "jv_refs": jv_refs,
-        "note_refs": [],
-        "note_uuids": [],
-        "children": children_ids,
+        "atom_id": make_atom_id(**atom_kwargs),
+        "atom_base_id": make_atom_base_id(**atom_kwargs),
+        "kind": "parent", "level": "paragraf_parent",
+        "section_label": stk_children[0].get("section_label"),
+        "paragraf": p, "stk": None, "nr": None, "text_plain": text_plain,
+        "note_anchors": [], "dom_refs": extract_dom_references(text_plain), "jv_refs": extract_jv_references(text_plain),
+        "note_refs": [], "note_uuids": [],
+        "children": [c.get("chunk_id") for c in stk_children],
         "anchor_map": anchor_map,
-        "created_from": {"paragraf_intro_id": (paragraf_intro_c or {}).get("chunk_id"), "child_ids": children_ids},
-        # Split-ready struktur (klar til aktivering)
-        "part_index": 1,
-        "part_total": 1,
-        "split_reason": None,
+        "created_from": {"paragraf_intro_id": (paragraf_intro_c or {}).get("chunk_id"), "child_ids": [c.get("chunk_id") for c in stk_children]},
+        "part_index": 1, "part_total": 1, "split_reason": None,
     }
-
 
 def make_section_parent(section_label: str, chunks: List[Dict[str, Any]],
                         paragrafs_in_section: List[str],
-                        paragraf_intro: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not paragrafs_in_section:
-        return None
-    bullets = []
-    children_ids = []
+                        paragraf_intro: Dict[str, Dict[str, Any]], law_id: str) -> Optional[Dict[str, Any]]:
+    if not paragrafs_in_section: return None
+    
+    bullets, children_ids = [], []
     for p in paragrafs_in_section:
         pi = paragraf_intro.get(p)
-        if not pi:
-            continue
-        ess = summarize_bullet_no_ellipses(pi.get("text_plain", ""))
-        bullets.append(f"§ {p} — {ess}")
-        # Child peger helst til paragraf_parent (hvis findes) ellers paragraf_intro
+        if not pi: continue
+        bullets.append(f"§ {p} — {summarize_bullet_no_ellipses(pi.get('text_plain', ''))}")
         pp = next((c for c in chunks if c.get("paragraf") == p and c.get("level") == 'paragraf_parent'), None)
         children_ids.append(pp.get("chunk_id") if pp else pi.get("chunk_id"))
-
-    if not bullets:
-        return None
-
-    intro = intro_no_ellipses(section_label)  # FIX: Konsistens - brug hele sætning/label
-    text_plain = intro + "\n" + "\n".join(f"• {b}" for b in bullets)
-
-    # anchor_map: samle laveste børn
-    anchor_map: Dict[str, str] = {}
+    
+    if not bullets: return None
+    
+    intro = intro_no_ellipses(section_label)
+    text_plain = clean_ellipses_from_text(intro + "\n" + "\n".join(f"• {b}" for b in bullets))
+    
+    anchor_map = {}
     for p in paragrafs_in_section:
-        # hvis paragraf_parent findes, saml derfra; ellers fra stk/nr
         pp = next((c for c in chunks if c.get("paragraf") == p and c.get("level") == 'paragraf_parent'), None)
         if pp:
-            for nid, cid in (pp.get("anchor_map") or {}).items():
-                anchor_map.setdefault(nid, cid)
+            for nid, cid in (pp.get("anchor_map") or {}).items(): anchor_map.setdefault(nid, cid)
         else:
-            # Fald tilbage: find nr/stk for §
             for ch in chunks:
                 if ch.get("paragraf") == p and ch.get("level") in ("nr", "stk"):
-                    for nid in ch.get("note_refs", []) or []:
-                        anchor_map.setdefault(nid, ch.get("chunk_id"))
-
-    # FIX: Post-tjek for ellipser
-    text_plain = clean_ellipses_from_text(text_plain)
+                    for nid in ch.get("note_refs", []): anchor_map.setdefault(nid, ch.get("chunk_id"))
     
-    # Parent chunks indeholder genereret tekst uden note-markeringer
-    text_plain_clean = text_plain.strip()
-    
-    # Udtræk metadata fra parent tekst (ingen note-ankre i genereret tekst)
-    note_anchors = []  # Parent chunks har ingen note-ankre
-    dom_refs = extract_dom_references(text_plain_clean)
-    jv_refs = extract_jv_references(text_plain_clean)
-
-    # Parent chunks er af type "parent"
-    law_id = "KSL_2025-04-11_nr460"
-    atom_id = make_atom_id(
-        law_id=law_id,
-        section=section_label,
-        kind="parent"
-    )
-    
+    atom_kwargs = {"law_id": law_id, "section": section_label, "kind": "parent"}
     return {
-        "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
+        "uuid": generate_chunk_uuid(),
         "chunk_id": make_chunk_id(None, section=section_label, parent_label='section_parent'),
-        "atom_id": atom_id,  # Ny deterministisk ID
-        "kind": "parent",  # Ny atomtype
-        "level": "section_parent",
+        "atom_id": make_atom_id(**atom_kwargs),
+        "atom_base_id": make_atom_base_id(**atom_kwargs),
+        "kind": "parent", "level": "section_parent",
         "section_label": section_label,
-        "paragraf": None, "stk": None, "nr": None,
-        "text_plain": text_plain_clean,
-        "note_anchors": note_anchors,
-        "dom_refs": dom_refs,
-        "jv_refs": jv_refs,
-        "note_refs": [],
-        "note_uuids": [],
-        "children": children_ids,
-        "anchor_map": anchor_map,
+        "paragraf": None, "stk": None, "nr": None, "text_plain": text_plain,
+        "note_anchors": [], "dom_refs": extract_dom_references(text_plain), "jv_refs": extract_jv_references(text_plain),
+        "note_refs": [], "note_uuids": [],
+        "children": children_ids, "anchor_map": anchor_map,
         "created_from": {"child_ids": children_ids},
-        # Split-ready struktur (klar til aktivering)
-        "part_index": 1,
-        "part_total": 1,
-        "split_reason": None,
+        "part_index": 1, "part_total": 1, "split_reason": None,
     }
 
-
-# ------------------------------
-# Output helpers
-# ------------------------------
-
 def write_jsonl(path: str, rows: List[Dict[str, Any]]):
-    """Skriv chunks som JSONL (JSON Lines) - en chunk per linje."""
     with open(path, 'w', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-
 def write_json(path: str, rows: List[Dict[str, Any]]):
-    """Skriv chunks som standard JSON array."""
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-
-def clean_note_chunk_fields(chunks: List[Dict[str, Any]]) -> None:
-    """Fjern overflødige felter fra note-chunks for et renere output."""
-    # Note: Med den nye metadata-struktur er der færre redundante felter at fjerne
-    # Men vi kan stadig fjerne note_refs og note_uuids da de ikke giver mening for note-chunks
-    fields_to_remove = ["note_refs", "note_uuids"]
-    for chunk in chunks:
-        if chunk.get("level") == "note":
-            for field in fields_to_remove:
-                if field in chunk:
-                    del chunk[field]
-
-
-
-
-
-def write_csv(path: str, rows: List[Dict[str, Any]]):
-    # This function is no longer used, but kept for potential future use.
-    # To re-enable, add the call back in main() and ensure pandas is handled.
-    pass
-
-
-# ------------------------------
-# CLI
-# ------------------------------
-
 def main():
-    ap = argparse.ArgumentParser(description='Markdown → juridiske chunks + parent‑noder')
-    ap.add_argument('--input', required=True, help='Sti til markdown‑filen')
-    ap.add_argument('--out-prefix', default=None, help='Filprefix for output (uden endelse)')
-    ap.add_argument('--use-llm-parents', action='store_true', help='Brug LLM til at generere parent chunk bullets')
-    ap.add_argument('--fireworks-api-key', help='Fireworks API key (alternativ til miljøvariabel)')
-    ap.add_argument('--no-csv', action='store_true', help='Undlad at generere en CSV-fil')
-    ap.add_argument('--max-tokens', type=int, default=275, help='Maksimalt antal tokens per chunk (standard: 275, sæt til 0 for at deaktivere split)')
+    print(f"--- SCRIPT START: {os.path.abspath(__file__)} ---")
+    sys.stdout.flush()
+    
+    ap = argparse.ArgumentParser(description='Markdown → juridiske chunks')
+    ap.add_argument('--input', required=True)
+    ap.add_argument('--out-prefix', default=None)
+    ap.add_argument('--max-tokens', type=int, default=275)
+    ap.add_argument('--law-id', default=None)
+    ap.add_argument('--use-llm-parents', action='store_true')
     args = ap.parse_args()
 
     in_path = args.input
-    assert os.path.exists(in_path), f'Inputfil ikke fundet: {in_path}'
     out_prefix = args.out_prefix or os.path.splitext(os.path.basename(in_path))[0].replace(' ', '_')
     
-    # Initialize LLM if requested
-    llm = None
-    if args.use_llm_parents:
-        if not FIREWORKS_AVAILABLE:
-            print("Warning: Fireworks not available. Install with: pip install fireworks-ai")
-            print("Falling back to rule-based parent generation.")
-        else:
-            print("Initializing Fireworks LLM for parent generation...")
-            # Debug: API key provided via arguments (removed for production)
-            llm = get_fireworks_llm(api_key=getattr(args, 'fireworks_api_key', None))
-            if llm:
-                print("✅ LLM initialized successfully!")
-            else:
-                print("❌ LLM initialization failed. Using rule-based fallback.")
+    law_id = args.law_id or auto_derive_law_id(os.path.basename(in_path))
+    print(f"📋 Law ID: {law_id}")
+    sys.stdout.flush()
 
     with open(in_path, 'r', encoding='utf-8') as f:
         lines = f.read().splitlines()
 
-    chunks, note_bodies, note_uuid_map = parse_document(lines)
+    print("🚀 STARTING: parse_document...")
+    sys.stdout.flush()
+    chunks, _, note_uuid_map = parse_document(lines, law_id)
+    print(f"✅ COMPLETED: parse_document - Generated {len(chunks)} initial chunks")
+    sys.stdout.flush()
     
-    # Build cross-references between chunks and notes
     build_cross_references(chunks, note_uuid_map)
-    
-    # Clean up orphaned note references
-    clean_orphaned_note_references(chunks, note_uuid_map)
-
-    # Apply note context
     apply_note_context(chunks)
+    update_note_atom_ids_with_context(chunks, law_id)
+
+    print("🏗️  STARTING: Parent generation...")
+    sys.stdout.flush()
+    by_p, by_ps, _, p_intro, sec_to_p = index_by_hierarchy(chunks)
     
-    # Simple QA check
-    print(f"📊 Generated {len(chunks)} chunks with UUID cross-references")
-
-    # Indekser til parent‑bygning
-    by_p, by_ps, by_psn, p_intro, sec_to_p = index_by_hierarchy(chunks)
-
-    # 1) stk_parent pr. (p, s) med nr‑børn
-    stk_parents: List[Dict[str, Any]] = []
-    for (p, s), arr in by_ps.items():
-        # tjek om der findes nr‑børn for denne (p,s)
-        nr_children = [c for c in chunks if c.get('paragraf') == p and c.get('stk') == s and c.get('level') == 'nr']
-        if nr_children:
-            parent = make_stk_parent(chunks, p, s, p_intro.get(p), use_llm=args.use_llm_parents, llm=llm)
-            if parent:
-                stk_parents.append(parent)
-
+    llm = get_fireworks_llm() if args.use_llm_parents else None
+    
+    stk_parents = [p for p_s in by_ps for p in [make_stk_parent(chunks, p_s[0], p_s[1], p_intro.get(p_s[0]), law_id, args.use_llm_parents, llm)] if p]
     chunks.extend(stk_parents)
-
-    # 2) paragraf_parent pr. § med mindst ét stk (eller stk_parent)
-    paragraf_parents: List[Dict[str, Any]] = []
-    for p, arr in by_p.items():
-        has_stk = any(c.get('paragraf') == p and c.get('level') in ('stk', 'stk_parent') and c.get('nr') is None for c in chunks)
-        if has_stk:
-            parent = make_paragraf_parent(chunks, p, p_intro.get(p))
-            if parent:
-                paragraf_parents.append(parent)
-
+    
+    paragraf_parents = [p for p_key in by_p for p in [make_paragraf_parent(chunks, p_key, p_intro.get(p_key), law_id)] if p]
     chunks.extend(paragraf_parents)
 
-    # 3) section_parent (kapitel/afsnit)
-    section_parents: List[Dict[str, Any]] = []
-    for sec_label, paragrafs in sec_to_p.items():
-        parent = make_section_parent(sec_label, chunks, paragrafs, p_intro)
-        if parent:
-            section_parents.append(parent)
-
+    section_parents = [p for sec, pars in sec_to_p.items() for p in [make_section_parent(sec, chunks, pars, p_intro, law_id)] if p]
     chunks.extend(section_parents)
+    print(f"✅ COMPLETED: Parent generation. Total chunks: {len(chunks)}")
+    sys.stdout.flush()
 
-    # Ryd op i note-felter før output
-    clean_note_chunk_fields(chunks)
+
+    print(f"📊 Validating {len(chunks)} chunks before splitting...")
+    sys.stdout.flush()
+    validate_atom_id_uniqueness(chunks)
     
-    # Split-logik (aktiveret som standard)
     if args.max_tokens and args.max_tokens > 0:
-        print(f"🔧 Token-begrænsning aktiveret: {args.max_tokens} tokens per chunk")
-        original_count = len(chunks)
-        split_chunks = []
-        
-        for chunk in chunks:
-            text = chunk.get("text_plain", "")
-            if should_split_chunk(text, args.max_tokens):
-                # Split chunk i mindre dele
-                parts = split_chunk_by_tokens(chunk, args.max_tokens)
-                split_chunks.extend(parts)
-            else:
-                split_chunks.append(chunk)
-        
+        print(f"🔧 Splitting chunks with max_tokens={args.max_tokens}...")
+        sys.stdout.flush()
+        split_chunks = [part for chunk in chunks for part in split_chunk_by_tokens(chunk, args.max_tokens)]
+        print(f"📊 Validating {len(split_chunks)} chunks after splitting...")
+        sys.stdout.flush()
+        validate_atom_id_uniqueness(split_chunks)
         chunks = split_chunks
-        print(f"📊 Split-resultat: {original_count} → {len(chunks)} chunks")
 
-    # Skriv filer i begge formater
-    jsonl_path = f"{out_prefix}_chunks.jsonl"
-    json_path = f"{out_prefix}_chunks.json"
-    
+    output_dir = os.path.dirname(out_prefix)
+    if output_dir: os.makedirs(output_dir, exist_ok=True)
+        
+    jsonl_path, json_path = f"{out_prefix}_chunks.jsonl", f"{out_prefix}_chunks.json"
     write_jsonl(jsonl_path, chunks)
     write_json(json_path, chunks)
-
-    if not args.no_csv:
-        csv_path = f"{out_prefix}_chunks.csv"
-        # write_csv(csv_path, chunks) # Deaktiveret
-        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} + {json_path} (CSV output er deaktiveret)")
-    else:
-        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} + {json_path}")
-
+    print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} + {json_path}")
+    sys.stdout.flush()
 
 if __name__ == '__main__':
     main()

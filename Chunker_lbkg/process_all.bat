@@ -1,9 +1,17 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM --- Chunker Batch Script ---
+REM --- Chunker Batch Script (Phase 3 - ASCII-Safe Atom_ID) ---
 REM Kører chunkerlbkg.py på alle .md-filer i input-mappen
 REM 
+REM NYE FUNKTIONER I PHASE 3:
+REM - ASCII-sikre atom_id'er: bruger 'par' i stedet for '§'
+REM - Stabile base_id'er: atom_base_id uden part-suffix for grouping
+REM - Auto law_id afledning: fra filnavn (fx KSL_2025-04-11_nr460)
+REM - Udvidede QA-tjek: validerer konsistens og unikhed
+REM - Litra/punkt support: fuld hierarki-parsing
+REM - JSON + JSONL output: begge formater genereres
+REM
 REM SPLIT-FUNKTIONALITET:
 REM - Standard: 275 tokens per chunk (aktiveret)
 REM - For at deaktivere: ændr --max-tokens 275 til --max-tokens 0
@@ -60,8 +68,14 @@ for %%f in ("%INPUT_DIR%\*.md") do (
     REM Definer output-sti
     set "OUTPUT_PREFIX=%OUTPUT_DIR%\!FILENAME!"
 
-    REM Kør Python-scriptet med split-funktionalitet aktiveret (275 tokens)
-    REM For at deaktivere split: tilføj --max-tokens 0
+    REM Kør Python-scriptet med alle nye funktioner aktiveret
+    REM --max-tokens 275: Split-funktionalitet (0 = deaktiveret)
+    REM --law-id: Kan angives manuelt (ellers auto-afledt fra filnavn)
+    REM --no-csv: Undgår CSV-output (kun JSON/JSONL)
+    echo.
+    echo DEBUG: Kører kommando:
+    echo python "%SCRIPT_PATH%" --input "%%f" --out-prefix "!OUTPUT_PREFIX!" --no-csv --max-tokens 275
+    echo.
     python "%SCRIPT_PATH%" --input "%%f" --out-prefix "!OUTPUT_PREFIX!" --no-csv --max-tokens 275
     
     echo.
@@ -71,5 +85,15 @@ echo --------------------------------------------------
 echo.
 echo Alle filer er blevet behandlet.
 echo Output-filer er gemt i mappen: "%OUTPUT_DIR%"
+echo.
+echo GENEREREDE FILER:
+echo - *_chunks.jsonl  (JSON Lines format)
+echo - *_chunks.json   (Standard JSON array)
+echo.
+echo NYE FELTER I OUTPUT:
+echo - atom_id: ASCII-sikker deterministisk ID (par1--stk1--nr3--kindrule)
+echo - atom_base_id: Stabil base-ID uden part-suffix
+echo - kind: Atomtype (rule/note/section/parent)
+echo - law_id: Auto-afledt fra filnavn
 echo.
 pause

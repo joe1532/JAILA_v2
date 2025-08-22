@@ -19,6 +19,17 @@ from __future__ import annotations
 import re, os, json, argparse, csv, uuid
 from typing import List, Dict, Any, Optional, Tuple
 
+def safe_print(text: str):
+    try:
+        print(text)
+    except Exception:
+        try:
+            import sys
+            enc = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
+            sys.stdout.write((str(text) + "\n").encode(enc, errors='replace').decode(enc))
+        except Exception:
+            pass
+
 # LLM imports (optional)
 try:
     from fireworks import LLM
@@ -47,6 +58,103 @@ ANCHOR_FMT = "⟦{id}⟧"
 def generate_chunk_uuid() -> str:
     """Generate full random UUID for chunks to avoid collisions."""
     return str(uuid.uuid4())  # Fuld UUID: "123e4567-e89b-12d3-a456-426614174000"
+
+
+# ------------------------------
+# Identitets-hjælpere
+# ------------------------------
+
+def normalize_coordinate(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return re.sub(r'[^0-9A-Za-z]', '', str(value)).lower()
+
+
+def auto_derive_law_id(filename: str) -> str:
+    filename = filename.strip()
+    date_nr_match = re.search(r'\((\d{4}-\d{2}-\d{2})\s+nr\.\s*(\d+)\)', filename)
+    if date_nr_match:
+        date_part = date_nr_match.group(1)
+        nr_part = date_nr_match.group(2)
+        suffix = f"{date_part}_nr{nr_part}"
+    else:
+        suffix = "unknown"
+
+    filename_lower = filename.lower()
+    if "kildeskat" in filename_lower:
+        prefix = "KSL"
+    elif "personskat" in filename_lower:
+        prefix = "PSL"
+    elif "selskabsskat" in filename_lower:
+        prefix = "SSL"
+    elif "momsloven" in filename_lower or "moms" in filename_lower:
+        prefix = "ML"
+    elif "afskrivningsloven" in filename_lower:
+        prefix = "AL"
+    elif "ligningsloven" in filename_lower:
+        prefix = "LL"
+    elif "skatteforvaltningsloven" in filename_lower:
+        prefix = "SFL"
+    else:
+        first_word = filename.split()[0] if filename.split() else "UNK"
+        prefix = re.sub(r'[^A-Za-z]', '', first_word)[:3].upper() or "UNK"
+
+    return f"{prefix}_{suffix}"
+
+
+def make_atom_id(law_id: str,
+                 par: Optional[str] = None,
+                 stk: Optional[str] = None,
+                 nr: Optional[str] = None,
+                 lit: Optional[str] = None,
+                 pkt: Optional[str] = None,
+                 part_info: Optional[Tuple[int, int]] = None,
+                 kind: str = "rule",
+                 note_id: Optional[str] = None,
+                 section: Optional[str] = None) -> str:
+    parts = [law_id]
+
+    if section and not par:
+        section_norm = normalize_coordinate(section.replace(" ", "_"))
+        parts.append(f"section{section_norm}")
+        parts.append(f"kindparent")
+        return "--".join(parts)
+
+    if par:
+        parts.append(f"par{normalize_coordinate(par)}")
+        if stk:
+            parts.append(f"stk{normalize_coordinate(stk)}")
+        elif nr or kind in ("rule", "note"):
+            parts.append("stk1")
+        if nr:
+            parts.append(f"nr{normalize_coordinate(nr)}")
+        if lit:
+            parts.append(f"lit{normalize_coordinate(lit)}")
+        if pkt:
+            parts.append(f"pkt{normalize_coordinate(pkt)}")
+
+    if part_info and len(part_info) == 2:
+        i, total = part_info
+        parts.append(f"part{i}-of-{total}")
+
+    parts.append(f"kind{kind}")
+
+    if note_id:
+        parts.append(f"note{note_id}")
+
+    return "--".join(parts)
+
+
+def make_atom_base_id(law_id: str,
+                      par: Optional[str] = None,
+                      stk: Optional[str] = None,
+                      nr: Optional[str] = None,
+                      lit: Optional[str] = None,
+                      pkt: Optional[str] = None,
+                      kind: str = "rule",
+                      note_id: Optional[str] = None,
+                      section: Optional[str] = None) -> str:
+    return make_atom_id(law_id, par, stk, nr, lit, pkt, None, kind, note_id, section)
 
 
 def estimate_tokens(text: str) -> int:
@@ -170,7 +278,7 @@ def split_chunk_by_tokens(chunk: Dict[str, Any], max_tokens: int) -> List[Dict[s
         return [chunk]
     
     # PLACEHOLDER: Deaktiveret indtil videre
-    print(f"⚠️  Split-funktionalitet er forberedt men ikke aktiveret. Chunk {chunk.get('chunk_id')} har {estimate_tokens(text)} tokens.")
+    safe_print(f"Split-funktionalitet er forberedt men ikke aktiveret. Chunk {chunk.get('chunk_id')} har {estimate_tokens(text)} tokens.")
     return [chunk]
     
     # FRAMEWORK KLAR TIL AKTIVERING:
@@ -219,7 +327,7 @@ def get_fireworks_llm(api_key=None):
             deployment_type="serverless"
         )
     except Exception as e:
-        print(f"Warning: Could not initialize Fireworks LLM: {e}")
+        safe_print(f"Warning: Could not initialize Fireworks LLM: {e}")
         return None
 
 def generate_llm_bullets(children_chunks: List[Dict[str, Any]], 
@@ -262,7 +370,7 @@ Skattepligt omfatter følgende personer:
         # DEBUG: print(f"🤖 LLM Response ({len(result)} chars): {result[:100]}...")
         return result
     except Exception as e:
-        print(f"Warning: LLM call failed: {e}")
+        safe_print(f"Warning: LLM call failed: {e}")
         return None
 
 # ------------------------------
@@ -556,7 +664,7 @@ def make_chunk_id(paragraf: Optional[str], stk: Optional[str] = None, nr: Option
 # Parsing af dokument → basis‑chunks
 # ------------------------------
 
-def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
     """Returnér (chunks, note_bodies)."""
     # 1) Opsamling af note‑kroppe nederst
     note_bodies: Dict[str, str] = {}
@@ -593,7 +701,7 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         if not ctx["paragraf"] and not ctx["section"]:
             # Extra check: skip if content looks like YAML front matter or metadata
             if body.startswith('---') or 'source_file:' in body or 'converted_at:' in body:
-                print(f"🧹 Skipping YAML/metadata chunk: {body[:50]}...")
+                safe_print(f"Skipping YAML/metadata chunk: {body[:50]}...")
                 ctx["buf"] = []
                 return
             ctx["buf"] = []
@@ -605,7 +713,7 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         else:
             eff_stk = ctx["stk"]
             level = "nr" if ctx["nr"] is not None else ("stk" if ctx["stk"] is not None else "paragraf")
-        
+        kind = "rule"
         # Fjern note-markeringer fra tekst for at få ren text_plain FØRST
         text_plain = re.sub(r'\(\u200B?\d+\u200B?\)', '', body).strip()
         
@@ -617,14 +725,38 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         # Udtræk note_ids for kompatibilitet
         note_ids = [anchor["note_id"] for anchor in note_anchors]
         
+        # IDs
+        atom_base_id = make_atom_base_id(
+            law_id=law_id,
+            par=ctx["paragraf"],
+            stk=eff_stk,
+            nr=ctx["nr"],
+            kind=kind
+        )
+        atom_id = make_atom_id(
+            law_id=law_id,
+            par=ctx["paragraf"],
+            stk=eff_stk,
+            nr=ctx["nr"],
+            kind=kind
+        )
+
         chunks.append({
             "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
             "chunk_id": make_chunk_id(ctx["paragraf"], eff_stk, ctx["nr"], section=None),
+            "law_id": law_id,
+            "atom_id": atom_id,
+            "atom_base_id": atom_base_id,
+            "kind": kind,
+            "embeddable": True,
             "level": level,
             "section_label": ctx["section"],
             "paragraf": ctx["paragraf"],
+            "par": ctx["paragraf"],
             "stk": eff_stk,
             "nr": ctx["nr"],
+            "litra": None,
+            "pkt": None,
             "text_plain": text_plain,
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
@@ -661,12 +793,21 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
             # Udtræk note_ids for kompatibilitet
             note_ids = [anchor["note_id"] for anchor in note_anchors]
             
+            # IDs for section as parent
+            sec_atom_base_id = make_atom_base_id(law_id=law_id, section=current_section_label, kind="parent")
+            sec_atom_id = make_atom_id(law_id=law_id, section=current_section_label, kind="parent")
+
             chunks.append({
                 "uuid": generate_chunk_uuid(),  # FIX: Unikt UUID
                 "chunk_id": make_chunk_id(None, section=current_section_label),
+                "law_id": law_id,
+                "atom_id": sec_atom_id,
+                "atom_base_id": sec_atom_base_id,
+                "kind": "parent",
+                "embeddable": False,
                 "level": "afsnit",
                 "section_label": current_section_label,
-                "paragraf": None, "stk": None, "nr": None,
+                "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
                 "text_plain": text_plain,
                 "note_anchors": note_anchors,
                 "dom_refs": dom_refs,
@@ -765,12 +906,21 @@ def parse_document(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, st
         dom_refs = extract_dom_references(text_plain)
         jv_refs = extract_jv_references(text_plain)
         
+        # IDs for notes (without coordinate context initially)
+        note_atom_base_id = make_atom_base_id(law_id=law_id, kind="note", note_id=nid)
+        note_atom_id = make_atom_id(law_id=law_id, kind="note", note_id=nid)
+
         chunks.append({
             "uuid": note_uuid,
             "chunk_id": f"note({nid})",
+            "law_id": law_id,
+            "atom_id": note_atom_id,
+            "atom_base_id": note_atom_base_id,
+            "kind": "note",
+            "embeddable": True,
             "level": "note",
             "section_label": None,
-            "paragraf": None, "stk": None, "nr": None,
+            "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
             "text_plain": text_plain,
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
@@ -870,9 +1020,9 @@ def clean_orphaned_note_references(chunks: List[Dict[str, Any]], note_uuid_map: 
         
         if orphaned_refs or orphaned_anchors > 0:
             if orphaned_refs:
-                print(f"🧹 Cleaned orphaned note refs {orphaned_refs} from {chunk.get('chunk_id', 'unknown')}")
+                safe_print(f"Cleaned orphaned note refs {orphaned_refs} from {chunk.get('chunk_id', 'unknown')}")
             if orphaned_anchors > 0:
-                print(f"🧹 Cleaned {orphaned_anchors} orphaned note anchors from {chunk.get('chunk_id', 'unknown')}")
+                safe_print(f"Cleaned {orphaned_anchors} orphaned note anchors from {chunk.get('chunk_id', 'unknown')}")
 
 
 # ------------------------------
@@ -1206,6 +1356,11 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]):
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+def write_json(path: str, rows: List[Dict[str, Any]]):
+    """Skriv chunks som standard JSON array."""
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
 
 def clean_note_chunk_fields(chunks: List[Dict[str, Any]]) -> None:
     """Fjern overflødige felter fra note-chunks for et renere output."""
@@ -1245,26 +1400,29 @@ def main():
     in_path = args.input
     assert os.path.exists(in_path), f'Inputfil ikke fundet: {in_path}'
     out_prefix = args.out_prefix or os.path.splitext(os.path.basename(in_path))[0].replace(' ', '_')
+
+    # law_id: CLI override eller auto-afledning
+    law_id = auto_derive_law_id(os.path.splitext(os.path.basename(in_path))[0])
     
     # Initialize LLM if requested
     llm = None
     if args.use_llm_parents:
         if not FIREWORKS_AVAILABLE:
-            print("Warning: Fireworks not available. Install with: pip install fireworks-ai")
-            print("Falling back to rule-based parent generation.")
+            safe_print("Warning: Fireworks not available. Install with: pip install fireworks-ai")
+            safe_print("Falling back to rule-based parent generation.")
         else:
-            print("Initializing Fireworks LLM for parent generation...")
+            safe_print("Initializing Fireworks LLM for parent generation...")
             # Debug: API key provided via arguments (removed for production)
             llm = get_fireworks_llm(api_key=getattr(args, 'fireworks_api_key', None))
             if llm:
-                print("✅ LLM initialized successfully!")
+                safe_print("LLM initialized successfully!")
             else:
-                print("❌ LLM initialization failed. Using rule-based fallback.")
+                safe_print("LLM initialization failed. Using rule-based fallback.")
 
     with open(in_path, 'r', encoding='utf-8') as f:
         lines = f.read().splitlines()
 
-    chunks, note_bodies, note_uuid_map = parse_document(lines)
+    chunks, note_bodies, note_uuid_map = parse_document(lines, law_id)
     
     # Build cross-references between chunks and notes
     build_cross_references(chunks, note_uuid_map)
@@ -1276,7 +1434,7 @@ def main():
     apply_note_context(chunks)
     
     # Simple QA check
-    print(f"📊 Generated {len(chunks)} chunks with UUID cross-references")
+    safe_print(f"Generated {len(chunks)} chunks with UUID cross-references")
 
     # Indekser til parent‑bygning
     by_p, by_ps, by_psn, p_intro, sec_to_p = index_by_hierarchy(chunks)
@@ -1318,7 +1476,7 @@ def main():
     
     # Split-logik (klar til aktivering)
     if args.max_tokens:
-        print(f"🔧 Token-begrænsning aktiveret: {args.max_tokens} tokens per chunk")
+        safe_print(f"Token-begrænsning aktiveret: {args.max_tokens} tokens per chunk")
         original_count = len(chunks)
         split_chunks = []
         
@@ -1332,18 +1490,20 @@ def main():
                 split_chunks.append(chunk)
         
         chunks = split_chunks
-        print(f"📊 Split-resultat: {original_count} → {len(chunks)} chunks")
+        safe_print(f"Split-resultat: {original_count} -> {len(chunks)} chunks")
 
     # Skriv filer
     jsonl_path = f"{out_prefix}_chunks.jsonl"
+    json_path = f"{out_prefix}_chunks.json"
     write_jsonl(jsonl_path, chunks)
+    write_json(json_path, chunks)
 
     if not args.no_csv:
         csv_path = f"{out_prefix}_chunks.csv"
         # write_csv(csv_path, chunks) # Deaktiveret
-        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path} (CSV output er deaktiveret)")
+        safe_print(f"Wrote {len(chunks)} chunks -> {jsonl_path} + {json_path} (CSV output er deaktiveret)")
     else:
-        print(f"📁 Wrote {len(chunks)} chunks → {jsonl_path}")
+        safe_print(f"Wrote {len(chunks)} chunks -> {jsonl_path} + {json_path}")
 
 
 if __name__ == '__main__':
