@@ -43,9 +43,9 @@ except ImportError:
 # FIX: Specifik til juridiske dokumenter - undgå falske "# Indledning" osv.
 RE_SECTION      = re.compile(r'^#\s*(AFSNIT|KAPITEL|DEL|BILAG)\s+(.+)$', re.IGNORECASE)
 # FIX: Understøt § med bogstav og mellemrum (§ 33 A)
-RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.?\s*(.*)$', re.IGNORECASE)
-# FIX: Case-insensitive Stk. matching (tillad valgfrit afsluttende punktum)
-RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.?', re.IGNORECASE)
+RE_PARAGRAF     = re.compile(r'^##\s*§\s*([0-9]+(?:\s*[A-Za-z]+)?)\.\s*(.*)$', re.IGNORECASE)
+# FIX: Case-insensitive Stk. matching
+RE_STK          = re.compile(r'^###\s*stk\.\s*([0-9A-Za-z]+)\.', re.IGNORECASE)
 # FIX: Understøt nr. med bogstav-suffiks (nr. 10 a)
 RE_NR           = re.compile(r'^###\s*(\d+(?:\s*[a-zA-Z]+)?)[\)\.]', re.IGNORECASE)
 # Litra under nr: a), b), c) osv.
@@ -58,7 +58,7 @@ RE_MD_PREFIX    = re.compile(r'^(#+)\s*')
 RE_INLINE_NOTE  = re.compile(r'\(\u200B?(\d+)\u200B?\)')  # inline notehenvisninger (med zero-width spaces)
 
 # Crossrefs patterns - enkle interne henvisninger
-_LAW_CODES = r'(?:KSL|SEL|EBL|AL|LL|ML|SFL|PSL|SSL|PBL)'
+_LAW_CODES = r'(?:KSL|SEL|EBL|AL|LL|ML|SFL|PSL|SSL)'
 RE_CROSSREF_BASIC = re.compile(
     r'(?:jf\.\s*|se\s*også\s*|jfr\.\s*|efter\s*|i\s*henhold\s*til\s*)?'  # valgfrit præfiks
     rf'(?:\b({_LAW_CODES})\s*)?'  # valgfrit lov-præfiks (kun kendte koder)
@@ -80,9 +80,6 @@ RE_CROSSREF_LIST = re.compile(
 )
 
 ANCHOR_FMT = "⟦{id}⟧"
-
-# Output schema version
-SCHEMA_VERSION = "1.0"
 
 def generate_chunk_uuid() -> str:
     """Generate full random UUID for chunks to avoid collisions."""
@@ -362,31 +359,12 @@ def make_atom_base_id(law_id: str,
 
 
 def estimate_tokens(text: str) -> int:
-    """Forbedret token-estimering (char vs word-baseret)."""
+    """Simpel token-estimering (ca. 4 karakterer per token for dansk tekst)."""
     if not text:
         return 0
-    char_based = max(1, len(text) // 4)
-    word_based = max(1, int(len(text.split()) * 1.3))
-    return max(char_based, word_based)
-
-
-def compute_sentence_offsets(text: str) -> List[int]:
-    """Naiv sætningsoffset: startindeks for hver sætning i text_plain."""
-    offsets: List[int] = []
-    if not text:
-        return offsets
-    offsets.append(0)
-    i = 0
-    while True:
-        dot = text.find('. ', i)
-        if dot == -1:
-            break
-        nxt = dot + 2
-        if nxt < len(text):
-            offsets.append(nxt)
-        i = nxt
-    # Unikke og sorterede
-    return sorted(set(o for o in offsets if 0 <= o < len(text)))
+    # Simpel heuristik: 4 karakterer ≈ 1 token for dansk tekst
+    # Dette kan senere erstattes med en rigtig tokenizer
+    return len(text) // 4
 
 
 def should_split_chunk(text: str, max_tokens: Optional[int]) -> bool:
@@ -820,8 +798,7 @@ def extract_jv_references(text: str) -> List[Dict[str, Any]]:
             "len": len(raw),
             "jv_id": jv_id,
             "section": section,
-            # Drop usikre link indtil vi kan slå rigtigt OID op
-            "link": ""
+            "link": link_url
         })
     
     return jv_refs
@@ -1015,9 +992,6 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             "litra": ctx.get("litra"),
             "pkt": ctx.get("pkt"),
             "text_plain": text_plain,
-            "token_count": estimate_tokens(text_plain),
-            "sentence_offsets": compute_sentence_offsets(text_plain),
-            "schema_version": SCHEMA_VERSION,
             "search_terms": "|".join([a for a in coord_aliases if a]),
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
@@ -1077,9 +1051,6 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
                 "section_label": current_section_label,
                 "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
                 "text_plain": text_plain,
-                "token_count": estimate_tokens(text_plain),
-                "sentence_offsets": compute_sentence_offsets(text_plain),
-                "schema_version": SCHEMA_VERSION,
                 "search_terms": "",
                 "note_anchors": note_anchors,
                 "dom_refs": dom_refs,
@@ -1194,9 +1165,6 @@ def parse_document(lines: List[str], law_id: str) -> Tuple[List[Dict[str, Any]],
             "section_label": None,
             "paragraf": None, "par": None, "stk": None, "nr": None, "litra": None, "pkt": None,
             "text_plain": text_plain,
-            "token_count": estimate_tokens(text_plain),
-            "sentence_offsets": compute_sentence_offsets(text_plain),
-            "schema_version": SCHEMA_VERSION,
             "search_terms": "",
             "note_anchors": note_anchors,
             "dom_refs": dom_refs,
@@ -1807,7 +1775,6 @@ def main():
     ap.add_argument('--no-csv', action='store_true', help='Undlad at generere en CSV-fil')
     ap.add_argument('--law-id', default=None, help='Angiv law_id (overstyrer auto-afledning fra filnavn)')
     ap.add_argument('--max-tokens', type=int, default=None, help='Maksimalt antal tokens per chunk (aktiverer auto-split)')
-    ap.add_argument('--split-last-par', action='store_true', help='Tillad split af sidste paragraf (default: nej)')
     args = ap.parse_args()
 
     in_path = args.input
@@ -1898,19 +1865,10 @@ def main():
         safe_print(f"Token-begrænsning aktiveret: {args.max_tokens} tokens per chunk")
         original_count = len(chunks)
         split_chunks = []
-        # Find sidste paragraf i dokumentet (brug sidste chunk med paragraf)
-        last_par = None
-        for c in reversed(chunks):
-            if c.get('paragraf'):
-                last_par = c.get('paragraf')
-                break
         
         for chunk in chunks:
             text = chunk.get("text_plain", "")
-            # Skip split for sidste paragraf hvis ikke eksplicit tilladt
-            if (not args.split_last_par) and last_par and chunk.get('paragraf') == last_par:
-                split_chunks.append(chunk)
-            elif should_split_chunk(text, args.max_tokens):
+            if should_split_chunk(text, args.max_tokens):
                 # Split chunk i mindre dele
                 parts = split_chunk_by_tokens(chunk, args.max_tokens)
                 split_chunks.extend(parts)
